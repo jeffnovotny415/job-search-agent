@@ -1665,7 +1665,6 @@ def run_job_crawl():
 
     # Run all crawlers
     all_jobs = []
-    all_jobs.extend(crawl_idealist())
     all_jobs.extend(crawl_remote_impact())
     all_jobs.extend(crawl_tech_jobs_for_good())
     all_jobs.extend(crawl_ffwd())
