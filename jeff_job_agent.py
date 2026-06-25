@@ -82,6 +82,10 @@ CONFIG = {
     # Seen jobs cache — prevents duplicate cards across runs
     "seen_jobs_file": "seen_jobs.json",
 
+    # Seen emails cache — prevents re-classifying the same email on every run
+    # This is the main cost control for the Gmail scanner
+    "seen_emails_file": "seen_emails.json",
+
     # Log file
     "log_file": "job_agent.log",
 }
@@ -278,6 +282,33 @@ def safe_parse_json_list(raw):
         except json.JSONDecodeError:
             continue
     return objects
+
+
+def load_seen_emails():
+    """
+    Loads the cache of email IDs that have already been classified.
+    Prevents re-sending the same email to Claude on every run —
+    the main cost control for the Gmail scanner.
+    """
+    path = Path(CONFIG["seen_emails_file"])
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+def save_seen_emails(seen):
+    with open(CONFIG["seen_emails_file"], "w") as f:
+        json.dump(seen, f, indent=2)
+
+def mark_email_seen(seen_emails, email_id, company, classification):
+    """Records an email as processed so it's never re-classified."""
+    seen_emails[email_id] = {
+        "company":       company,
+        "subject":       "",
+        "status_change": classification.get("status_change", "unknown"),
+        "confidence":    classification.get("confidence", "unknown"),
+        "date":          datetime.now().isoformat(),
+    }
 
 
 def job_fingerprint(company, title, url=""):
@@ -967,6 +998,11 @@ def run_gmail_scan():
     lookback = CONFIG["gmail_lookback_days"]
     moved = 0
     checked = 0
+    skipped_cached = 0
+
+    # Load seen emails cache — emails already classified won't be re-sent to Claude
+    seen_emails = load_seen_emails()
+    log.info(f"Seen emails cache: {len(seen_emails)} entries")
 
     for card in active_cards:
         # Extract company name from card title (format: "Company — Role")
@@ -1001,10 +1037,22 @@ def run_gmail_scan():
         log.info(f"  Found {len(emails)} email(s) for {company}")
 
         for email in emails:
+            # Skip if already classified in a previous run
+            if email['id'] in seen_emails:
+                log.info(
+                    f"    [{company}] Skipping cached email: '{email['subject']}' "
+                    f"(previously classified as {seen_emails[email['id']].get('status_change', 'unknown')})"
+                )
+                skipped_cached += 1
+                continue
+
             classification = classify_email_with_claude(service, email, company)
             if not classification:
                 log.warning(f"    [{company}] Classification failed for: {email['subject']}")
                 continue
+
+            # Mark email as seen so it's never re-classified
+            mark_email_seen(seen_emails, email['id'], company, classification)
 
             log.info(
                 f"    [{company}] '{email['subject']}' → "
@@ -1080,7 +1128,13 @@ def run_gmail_scan():
 
         time.sleep(0.5)  # Rate limiting
 
-    log.info(f"\nPipeline scan complete. Checked {checked} companies, moved {moved} cards.")
+    # Save seen emails cache
+    save_seen_emails(seen_emails)
+
+    log.info(
+        f"\nPipeline scan complete. Checked {checked} companies, "
+        f"moved {moved} cards, skipped {skipped_cached} cached emails."
+    )
 
     # ── Idealist job alert emails ──
     # Parse any Idealist alert emails and create Trello cards for new matches
@@ -1665,6 +1719,7 @@ def run_job_crawl():
 
     # Run all crawlers
     all_jobs = []
+    all_jobs.extend(crawl_idealist())
     all_jobs.extend(crawl_remote_impact())
     all_jobs.extend(crawl_tech_jobs_for_good())
     all_jobs.extend(crawl_ffwd())

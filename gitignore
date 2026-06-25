@@ -1,0 +1,43 @@
+# Credentials — never commit these
+.env
+credentials.json
+gmail_token.json
+
+# Personal scoring profile — never commit this
+profile.txt
+
+# Runtime files — local only
+seen_jobs.json
+seen_emails.json
+job_agent.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# Logs
+*.log
