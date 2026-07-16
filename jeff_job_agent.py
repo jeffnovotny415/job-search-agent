@@ -9,6 +9,7 @@ between pipeline stages automatically.
 Run manually:         python jeff_job_agent.py
 Run crawl only:       python jeff_job_agent.py --crawl
 Run Gmail scan only:  python jeff_job_agent.py --gmail
+Run reconcile only:   python jeff_job_agent.py --reconcile
 Schedule with cron:   0 8 * * * /usr/bin/python3 /path/to/jeff_job_agent.py
 
 First-time Gmail setup: python jeff_job_agent.py --gmail-setup
@@ -21,7 +22,9 @@ import time
 import hashlib
 import logging
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -66,7 +69,14 @@ CONFIG = {
         "interview":   "Interview",
         "closed":      "Closed",
         "rejected":    "Rejected",
+        "stale":       "Stale/No Reply",
     },
+
+    # Lists to search for fuzzy duplicates before creating a new card
+    "duplicate_check_lists": ["watching", "applied", "interview", "rejected", "stale"],
+
+    # How far back to look when checking for duplicate/reposted listings
+    "duplicate_lookback_days": 90,
 
     # Gmail OAuth — download credentials.json from Google Cloud Console
     # See SETUP GUIDE at the bottom of this file
@@ -77,7 +87,7 @@ CONFIG = {
     "min_score_for_card": 60,
 
     # How many days back to scan Gmail for status updates
-    "gmail_lookback_days": 14,
+    "gmail_lookback_days": 7,
 
     # Seen jobs cache — prevents duplicate cards across runs
     "seen_jobs_file": "seen_jobs.json",
@@ -85,6 +95,19 @@ CONFIG = {
     # Seen emails cache — prevents re-classifying the same email on every run
     # This is the main cost control for the Gmail scanner
     "seen_emails_file": "seen_emails.json",
+
+    # How many days back the Gmail-Trello reconciliation job searches for
+    # application-related threads that the per-company sync might have missed
+    "reconciliation_lookback_days": 14,
+
+    # Seen-threads cache for the reconciliation job — separate from
+    # seen_emails.json since it covers a broader, unrelated search
+    "seen_reconciliation_emails_file": "seen_reconciliation_emails.json",
+
+    # Threads that don't match any existing Trello card, for Jeff to review
+    # and confirm before anything gets created — the agent never writes a
+    # new card off a reconciliation match on its own
+    "orphan_candidates_file": "orphan_candidates.json",
 
     # Log file
     "log_file": "job_agent.log",
@@ -105,6 +128,56 @@ else:
         "profile.txt not found. Copy profile.example.txt to profile.txt "
         "and fill in your personal scoring criteria before running."
     )
+
+# ─────────────────────────────────────────────
+# PORTFOLIO PROJECTS
+# Named, real projects Claude can cite as a proof point on a card.
+# Scoring prompt picks the single best match (or none) — never leave
+# an unfilled template placeholder in a card description.
+# ─────────────────────────────────────────────
+
+PORTFOLIO_PROJECTS = [
+    {
+        "name": "RWA Grant Navigator",
+        "one_liner": "Claude-designed, Custom-GPT-deployed grant research workflow for a 6-volunteer nonprofit team; 70+ opportunities vetted, 50 surfaced.",
+        "best_for": ["Lane 3 AI Ops", "nonprofit", "edtech", "mission-driven ops"],
+    },
+    {
+        "name": "Job Search Automation Pipeline",
+        "one_liner": "Python + Gmail + Trello + Claude API pipeline that scores and routes job postings daily, unattended. Public repo.",
+        "best_for": ["Lane 3 AI Ops", "AI/agent-building roles"],
+    },
+    {
+        "name": "GrantOps",
+        "one_liner": "Productized version of the RWA grant workflow, packaged as a repeatable flat-fee offering for other schools.",
+        "best_for": ["Lane 3 AI Ops", "edtech", "systems-as-product roles"],
+    },
+    {
+        "name": "Reforge",
+        "one_liner": "Live, deployed fantasy-themed fitness RPG web app, built end-to-end with Claude Code; evolving toward a full lifestyle app.",
+        "best_for": ["AI-native builder roles", "hands-on technical depth signal"],
+    },
+    {
+        "name": "Paths of Wonder",
+        "one_liner": "Live interactive fiction engine (Python, data-driven story architecture, autosaving state), published and in active development.",
+        "best_for": ["AI-native builder roles", "creative tools", "gaming"],
+    },
+    {
+        "name": "The Sorting Room",
+        "one_liner": "Scoped email-triage automation (Node.js, Microsoft Graph, Claude API) for a small business client; est. $10-15/mo to run.",
+        "best_for": ["Lane 3 AI Ops", "Lane 1 IT Ops", "small-business/nonprofit ops"],
+    },
+    {
+        "name": "The Record Room",
+        "one_liner": "Compliance document-architecture system for a nonprofit school's business manager; reusable framework across clients.",
+        "best_for": ["Lane 1 IT Ops", "nonprofit/education compliance"],
+    },
+]
+
+_PORTFOLIO_PROJECTS_TEXT = "\n".join(
+    f"- {p['name']}: {p['one_liner']} (best for: {', '.join(p['best_for'])})"
+    for p in PORTFOLIO_PROJECTS
+)
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -135,6 +208,7 @@ TITLE_BLOCKLIST = [
     "sales", "account executive", "account manager", "business development",
     "revenue", "customer success", "renewals", "marketing", "recruiter",
     "recruiting", "talent acquisition", "finance", "accounting", "payroll",
+    "human resources", "hr manager", "hr director",
     "legal counsel", "attorney", "lawyer", "nurse", "physician", "clinical",
     "ux designer", "graphic designer", "data scientist",
     "data engineer", "machine learning engineer", "software engineer",
@@ -164,6 +238,7 @@ TITLE_ALLOWLIST = [
     "enablement manager", "platform operations", "community operations",
     "workflow automation", "instructional design", "enablement lead",
     "ai implementation lead", "learning design", "program operations",
+    "chief of staff",  # confirmed hits: Spark MicroGrants (62), NYC Kids RISE (88)
 ]
 
 # If the job description contains enough of these,
@@ -311,6 +386,31 @@ def mark_email_seen(seen_emails, email_id, company, classification):
     }
 
 
+def load_seen_reconciliation_emails():
+    """Cache of threads already processed by the reconciliation job."""
+    path = Path(CONFIG["seen_reconciliation_emails_file"])
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+def save_seen_reconciliation_emails(seen):
+    with open(CONFIG["seen_reconciliation_emails_file"], "w") as f:
+        json.dump(seen, f, indent=2)
+
+def load_orphan_candidates():
+    """Threads flagged as having no matching Trello card, pending Jeff's review."""
+    path = Path(CONFIG["orphan_candidates_file"])
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+def save_orphan_candidates(orphans):
+    with open(CONFIG["orphan_candidates_file"], "w") as f:
+        json.dump(orphans, f, indent=2)
+
+
 def job_fingerprint(company, title, url=""):
     """Stable hash so the same job isn't added twice even if URL changes slightly."""
     raw = f"{company.lower().strip()}|{title.lower().strip()}"
@@ -375,6 +475,219 @@ def add_comment_to_card(card_id, text):
     r = requests.post(url, params=trello_params({"text": text}))
     r.raise_for_status()
 
+def get_card_description(card_id):
+    """Fetches just the description field of a card."""
+    url = f"{TRELLO_BASE}/cards/{card_id}"
+    r = requests.get(url, params=trello_params({"fields": "desc"}))
+    r.raise_for_status()
+    return r.json().get("desc", "")
+
+def update_card_description(card_id, new_desc):
+    """Overwrites a card's description. Also bumps dateLastActivity."""
+    url = f"{TRELLO_BASE}/cards/{card_id}"
+    r = requests.put(url, params=trello_params({"desc": new_desc}))
+    r.raise_for_status()
+    return r.json()
+
+# ─────────────────────────────────────────────
+# DUPLICATE DETECTION
+# Fuzzy-matches a new listing against open pipeline cards before a
+# Trello card is created, so reposts get appended to the existing
+# card instead of showing up as a brand-new "Watching" entry.
+# ─────────────────────────────────────────────
+
+def normalize(text):
+    text = text.lower()
+    text = re.sub(r"\(remote\)|\(hybrid\)|\[.*?\]", "", text)
+    text = re.sub(r"[^a-z0-9 ]", "", text)
+    return " ".join(text.split())
+
+def parse_card_name(card_name):
+    """Splits a 'Company — Role' (or ' - ') card title into (company, title)."""
+    for sep in (" — ", " - "):
+        if sep in card_name:
+            company, _, title = card_name.partition(sep)
+            return company.strip(), title.strip()
+    return card_name.strip(), ""
+
+def is_likely_duplicate(new_company, new_title, existing_cards, threshold=0.85):
+    """
+    existing_cards: [{'company':..., 'title':..., 'card_id':..., 'list_name':...}]
+    Returns the matching existing card dict if found, else None.
+
+    Both sides are run through clean_company_name() first — an FFWD card
+    stored with a raw disambiguation-suffixed name ("CodePath Org 2") and
+    a cleanly-named one ("CodePath") need to resolve to the same company
+    here, or duplicate/reconciliation/orphan detection all silently miss
+    the match.
+    """
+    norm_new = normalize(f"{clean_company_name(new_company)} {new_title}")
+    for card in existing_cards:
+        norm_existing = normalize(f"{clean_company_name(card['company'])} {card['title']}")
+        ratio = SequenceMatcher(None, norm_new, norm_existing).ratio()
+        if ratio >= threshold:
+            return card
+    return None
+
+def get_cards_for_duplicate_check(list_map):
+    """
+    Fetches open cards from the pipeline lists worth checking for reposts
+    (Watching, Applied, Interview, Rejected, Stale/No Reply), limited to
+    cards active within the configured lookback window.
+    """
+    lookback_days = CONFIG["duplicate_lookback_days"]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+    cards = []
+    for key in CONFIG["duplicate_check_lists"]:
+        list_name = CONFIG["trello_lists"].get(key)
+        list_id = list_map.get(list_name)
+        if not list_id:
+            continue
+
+        for card in get_trello_cards(list_id):
+            last_activity = card.get("dateLastActivity")
+            if last_activity:
+                try:
+                    activity_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
+                    if activity_dt < cutoff:
+                        continue
+                except ValueError:
+                    pass
+
+            company, title = parse_card_name(card.get("name", ""))
+            if not company:
+                continue
+
+            cards.append({
+                "company":   company,
+                "title":     title,
+                "card_id":   card["id"],
+                "list_name": list_name,
+            })
+
+    return cards
+
+def get_all_board_cards(list_map):
+    """
+    All cards across every list on the board, with no lookback window —
+    used for orphan detection during Gmail-Trello reconciliation, where an
+    old card is still a valid match.
+    """
+    cards = []
+    for list_name, list_id in list_map.items():
+        for card in get_trello_cards(list_id):
+            company, title = parse_card_name(card.get("name", ""))
+            if not company:
+                continue
+            cards.append({
+                "company":   company,
+                "title":     title,
+                "card_id":   card["id"],
+                "list_name": list_name,
+            })
+    return cards
+
+def handle_possible_duplicate(existing_cards, company, title, source):
+    """
+    Checks a new listing against existing pipeline cards. If a fuzzy match
+    is found, appends a repost note to that card (bumping its activity so
+    it doesn't look falsely stale) instead of letting a new card get created.
+    Returns the matching card dict, or None if no duplicate was found.
+    """
+    match = is_likely_duplicate(company, title, existing_cards)
+    if not match:
+        return None
+
+    try:
+        current_desc = get_card_description(match["card_id"])
+        repost_count = current_desc.lower().count("reposted") + 1
+        note = (
+            f"\n\n— reposted {datetime.now().strftime('%Y-%m-%d')} "
+            f"(seen {repost_count}x, via {source}), no new card created"
+        )
+        update_card_description(match["card_id"], current_desc + note)
+        log.info(
+            f"  Duplicate: '{company} — {title}' matches existing card in "
+            f"'{match['list_name']}' — appended repost note (seen {repost_count}x) "
+            f"instead of creating a new card."
+        )
+    except Exception as e:
+        log.error(f"  Failed to update existing card for duplicate '{company} — {title}': {e}")
+
+    return match
+
+def create_card_or_note_duplicate(existing_cards, watching_list_id, company, title, card_desc, source_label):
+    """
+    Checks for a duplicate before creating a Trello card. If a duplicate is
+    found, appends a repost note to the existing card and returns None.
+    Otherwise creates the card, tracks it in existing_cards so later jobs
+    in this same run are also checked against it, and returns the card.
+    """
+    if handle_possible_duplicate(existing_cards, company, title, source_label):
+        return None
+
+    card_name = f"{company} — {title}"
+    try:
+        card = create_trello_card(watching_list_id, card_name, card_desc)
+        log.info(f"  ✓ Trello card created for {card_name}")
+        existing_cards.append({
+            "company":   company,
+            "title":     title,
+            "card_id":   card["id"],
+            "list_name": CONFIG["trello_lists"]["watching"],
+        })
+        return card
+    except Exception as e:
+        log.error(f"  Failed to create card for {card_name}: {e}")
+        return None
+
+# ─────────────────────────────────────────────
+# HARD DISQUALIFIER TRIPWIRE
+# The holistic scorer weighs title/salary/company well but has repeatedly
+# missed a few sentences buried in the JD that should override everything
+# else (e.g. a "Technical Project Manager" title whose actual job is
+# managing client accounts and revenue). This is a keyword tripwire that
+# runs alongside the narrative score, not a replacement for it — a match
+# can be a false positive (adjacent team mentioned, not the role itself),
+# so it flags for a second look rather than auto-rejecting.
+# ─────────────────────────────────────────────
+
+HARD_DISQUALIFIER_PATTERNS = {
+    "sales/RevOps/customer success": [
+        r"\bcustomer success\b", r"\baccount expansion\b", r"\bbook of business\b",
+        r"\brevenue cycle\b", r"\bquota\b", r"\brenewals?\b", r"\bupsell", r"\bcross-?sell",
+        r"\bsales pipeline\b", r"\baccount growth\b", r"\bclient portfolio strategy\b",
+        r"\bCRM hygiene\b", r"\bpipeline activity\b",
+    ],
+    "Paper Tiger pattern": [
+        r"\bclient relationship\b.{0,40}\b(manage|own)", r"\bclient relations account\b",
+        r"\baccount continuity\b", r"\bprofitability\b.{0,40}\bproject\b",
+    ],
+    "crypto": [r"\bcrypto\b", r"\bbitcoin\b", r"\bweb3\b", r"\bblockchain\b"],
+    "defense/aerospace": [r"\bdefense contractor\b", r"\bDoD\b", r"\bclassified\b", r"\bITAR\b"],
+    "hybrid/onsite required": [
+        r"\bhybrid\b", r"\bin-?person\b", r"\bon-?site required\b",
+        r"\bin.?office\b.{0,20}\b(days?|week)\b",
+        r"\b\d+\s*days?\s*(a|per)\s*week\s*in\s*(the\s*)?office\b",
+        r"\bmust work from (our|the) office\b",
+        # Named-weekday in-office requirements (e.g. "office Tuesdays,
+        # Thursdays, and additional days as needed") — added after testing
+        # showed the patterns above miss this phrasing, which is exactly
+        # how the confirmed United Way of Greater LA JD stated it.
+        r"\boffice\b.{0,80}\b(mondays?|tuesdays?|wednesdays?|thursdays?|fridays?)\b",
+    ],
+}
+
+def scan_for_hard_disqualifiers(jd_text):
+    """Returns list of triggered category names, empty if none."""
+    hits = []
+    lowered = (jd_text or "").lower()
+    for category, patterns in HARD_DISQUALIFIER_PATTERNS.items():
+        if any(re.search(p, lowered, re.IGNORECASE) for p in patterns):
+            hits.append(category)
+    return hits
+
 # ─────────────────────────────────────────────
 # CLAUDE SCORING
 # ─────────────────────────────────────────────
@@ -415,10 +728,29 @@ any company should score at least 55-70 based on title fit alone.
   "concerns": "2-3 sentences — include company size flag and change-management flag if applicable; if description is thin, note that full review needed",
   "cover_letter_angle": "one sentence",
   "salary_ask": "specific number or range",
+  "salary_source": "confirmed | estimated",
   "next_step": "one specific action",
   "puzzle_fit": true or false,
-  "environment_flags": ["list any: small-org, change-management-heavy, ownership-language, large-org-risk"]
+  "environment_flags": ["list any: small-org, change-management-heavy, ownership-language, large-org-risk"],
+  "portfolio_piece": "name of the single best-matching project below, or 'none strongly applicable'"
 }}
+
+Jeff's portfolio projects (for the portfolio_piece field):
+{_PORTFOLIO_PROJECTS_TEXT}
+
+From this list, choose the single project that would most strengthen an
+application for this specific role, based on lane and theme match. If none
+are a reasonably strong fit, set portfolio_piece to exactly
+"none strongly applicable" rather than picking a weak match. Use the
+project's "name" field verbatim — never invent a project or leave this
+field as a template placeholder.
+
+For salary_source: set it to "confirmed" ONLY if a specific salary number
+or range appears verbatim in the Description text below. Set it to
+"estimated" for anything else — including inferring from title, company,
+or market norms, or reading a number from alert metadata that wasn't
+itself pulled from the real job description. Do not mark something
+confirmed just because you feel confident in the estimate.
 
 Job details:
 Company: {job.get('company', 'Unknown')}
@@ -449,6 +781,49 @@ Description:
     except Exception as e:
         log.error(f"Claude API error for {job.get('title')}: {e}")
         return None
+
+
+def build_scored_card_description(job, result):
+    """Card body for a job that received a real Claude score."""
+    disqualifier_hits = scan_for_hard_disqualifiers(job.get("description", ""))
+    warning = (
+        f"⚠ POSSIBLE HARD DISQUALIFIER DETECTED: {', '.join(disqualifier_hits)} — "
+        f"verify before trusting the score below.\n\n"
+        if disqualifier_hits else ""
+    )
+
+    salary_source = str(result.get("salary_source", "")).strip().lower()
+    if salary_source == "confirmed":
+        salary_tag = f"[CONFIRMED — {job.get('url', 'source unavailable')}]"
+    else:
+        salary_tag = "[ESTIMATED — not verified against a real JD, re-check before relying on it]"
+
+    return f"""{warning}**Source:** {job['source']}
+**URL:** {job['url']}
+**Found:** {datetime.now().strftime('%Y-%m-%d')}
+
+---
+
+**Verdict:** {result.get('verdict', '?')} | **Score:** {result.get('score', '?')}/100
+**Lane:** {result.get('lane', '?')}
+**Mission fit:** {result.get('mission_fit', '?')}
+**Salary ask:** {result.get('salary_ask', '?')}  {salary_tag}
+
+**Why it fits:**
+{result.get('why_it_fits', '—')}
+
+**Concerns:**
+{result.get('concerns', '—')}
+
+**Cover letter angle:**
+{result.get('cover_letter_angle', '—')}
+
+**Next step:**
+{result.get('next_step', '—')}
+
+**Puzzle fit:** {'✓ Yes' if result.get('puzzle_fit') else '—'}
+**Environment flags:** {', '.join(result.get('environment_flags', [])) or '—'}
+**Portfolio piece:** {result.get('portfolio_piece') or 'none strongly applicable'}"""
 
 # ─────────────────────────────────────────────
 # JOB CRAWLERS
@@ -499,7 +874,7 @@ def crawl_remote_impact():
         "technology manager", "IT manager", "technical operations",
         "technical project manager", "technical program manager",
         "AI operations", "AI workflow", "automation manager",
-        "SaaS operations", "implementation manager", "program operations",
+        "SaaS operations", "implementation manager",
         "workplace technology", "systems manager", "internal tools",
         "digital workplace", "operations manager",
         # Expanded (June 2026)
@@ -590,7 +965,6 @@ def crawl_tech_jobs_for_good():
         "automation+manager",
         "SaaS+operations",
         "implementation+manager",
-        "program+operations",
         "workplace+technology",
         "systems+manager",
         "operations+manager",
@@ -677,6 +1051,92 @@ def crawl_tech_jobs_for_good():
     return jobs
 
 
+# A recurring subset of FFWD postings (FFWD runs on Greenhouse) come through
+# the search-results card scrape with a blank/"Unknown" company name. The
+# URL embeds the company slug reliably; the Greenhouse-generated <title> tag
+# ("Job Application for {Role} at {Company}") is a fallback/cross-check.
+#
+# FFWD's own slugs carry an internal multi-board disambiguation suffix
+# ("-org-2", trailing "-2", etc.) that has to be stripped before the name is
+# ever stored or compared — left in place, it silently defeats fuzzy
+# matching against cards that were named cleanly from another source (see
+# clean_company_name(), used everywhere company names get compared).
+KNOWN_NAME_ALIASES = {
+    "codepath": "CodePath",
+    "digital nest": "Digital Nest",
+}
+
+def clean_ffwd_company_name(raw_name):
+    """Strips FFWD's internal disambiguation suffix ('... Org N' or trailing ' N')."""
+    cleaned = re.sub(r"\s+Org\s+\d+$", "", raw_name or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+\d+$", "", cleaned)
+    return cleaned.strip()
+
+def apply_known_alias(cleaned_name):
+    return KNOWN_NAME_ALIASES.get(cleaned_name.lower(), cleaned_name)
+
+def clean_company_name(name):
+    """
+    Full cleanup pipeline for a company name: strip FFWD's disambiguation
+    suffix, then apply known stylized-capitalization aliases. Safe to run
+    on any company name, not just FFWD-sourced ones — a name with no
+    matching suffix passes through unchanged.
+    """
+    return apply_known_alias(clean_ffwd_company_name(name))
+
+def extract_company_from_ffwd_url(url):
+    """Pulls the company slug out of an FFWD URL, e.g.
+    jobs.ffwd.org/companies/codepath-org-2-a1b2c3d4-.../jobs/... -> 'CodePath'
+    """
+    match = re.search(r"/companies/([a-z0-9-]+?)-[0-9a-f]{8}-", url)
+    if not match:
+        return None
+    slug = match.group(1)
+    humanized = " ".join(word.capitalize() for word in slug.split("-"))
+    return clean_company_name(humanized)
+
+def extract_company_from_title(page_title):
+    """Matches Greenhouse's standard auto-generated title format."""
+    match = re.search(r"Job Application for .+ at (.+)$", page_title or "")
+    return clean_company_name(match.group(1).strip()) if match else None
+
+def backfill_ffwd_company(job):
+    """
+    If the listing-card scrape came back without a usable company name,
+    recover it from the URL slug (primary — doesn't depend on page
+    metadata, can't fail silently) or the page's <title> tag (fallback).
+    """
+    if job.get("company") and job["company"] not in ("", "Unknown", "See posting"):
+        return job
+
+    company = extract_company_from_ffwd_url(job.get("url", ""))
+
+    if not company:
+        r = safe_get(job["url"], timeout=20)
+        if r:
+            soup = BeautifulSoup(r.text, "html.parser")
+            if soup.title and soup.title.string:
+                company = extract_company_from_title(soup.title.string.strip())
+
+    if company:
+        log.info(f"  Backfilled FFWD company name: '{company}'")
+        job["company"] = company
+
+    return job
+
+
+# NOTE on FFWD coverage: this crawl only ever sees the first ~20
+# server-rendered results per query — FFWD's search page is a Getro-powered
+# Next.js app that reports a much larger true total (initialState.jobs.total
+# in its embedded page state) but only paginates the rest via a client-side
+# "Load more" button; `?page=2` is silently ignored. A posting that doesn't
+# rank in that first ~20 for any of our search terms can sit invisible for
+# weeks. A headless-browser fallback was tried and reverted — it tripped
+# what looks like FFWD's bot detection after a handful of automated
+# requests (deterministic "Download is starting" failures, even on fresh
+# queries and the bare homepage). Left as a known gap; see chat history
+# 2026-07-16 for the investigation.
+
 def crawl_ffwd():
     """
     Crawls jobs.ffwd.org (Fast Forward — nonprofit tech jobs)
@@ -699,7 +1159,6 @@ def crawl_ffwd():
         f"{base_url}/jobs?q=operations+manager",
         f"{base_url}/jobs?q=workplace+technology",
         f"{base_url}/jobs?q=systems+manager",
-        f"{base_url}/jobs?q=program+operations",
         f"{base_url}/jobs?q=digital+workplace",
         f"{base_url}/jobs?q=internal+tools",
         # Expanded (June 2026)
@@ -743,7 +1202,7 @@ def crawl_ffwd():
                     continue
                 seen_urls.add(href)
 
-                jobs.append({
+                job = {
                     "company":     company,
                     "title":       title,
                     "url":         href,
@@ -751,7 +1210,9 @@ def crawl_ffwd():
                     "salary":      "Not listed",
                     "description": card.get_text(separator=" ", strip=True)[:2000],
                     "source":      "FFWD Jobs",
-                })
+                }
+                job = backfill_ffwd_company(job)
+                jobs.append(job)
 
             except Exception as e:
                 log.warning(f"  Error parsing FFWD card: {e}")
@@ -797,6 +1258,87 @@ def enrich_job_description(job):
         job["description"] = text[:4000]
 
     return job
+
+
+# ─────────────────────────────────────────────
+# DESCRIPTION COMPLETENESS GATE
+# Gmail-alert jobs (esp. LinkedIn) frequently resolve to a login-walled
+# or empty description. Scoring those anyway produces a confident-looking
+# number with no real signal behind it. Gate blocks scoring in that case;
+# caller creates a "score withheld" card instead.
+# ─────────────────────────────────────────────
+
+DESCRIPTION_BLOCKED_MARKERS = [
+    "sign in to view", "login wall", "you must be signed in",
+    "javascript to run this app", "we cannot provide a description",
+]
+
+# Common ATS URL patterns, tried as a single fallback fetch when the
+# primary posting URL is blocked/thin and a company name is available.
+FALLBACK_ATS_URL_PATTERNS = [
+    "https://boards.greenhouse.io/{slug}",
+    "https://jobs.ashbyhq.com/{slug}",
+    "https://jobs.lever.co/{slug}",
+]
+
+
+def has_sufficient_description(raw_description):
+    """Return False if the description is too thin/blocked to score responsibly."""
+    if not raw_description or len(raw_description.strip()) < 300:
+        return False
+    lowered = raw_description.lower()
+    return not any(marker in lowered for marker in DESCRIPTION_BLOCKED_MARKERS)
+
+
+def company_slug(company):
+    """Best-effort URL slug guess from a company name, for ATS fallback lookups."""
+    return re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
+
+
+def attempt_fallback_description(job):
+    """
+    One fallback attempt when the primary description is blocked/thin:
+    try common ATS URL patterns derived from the company name. Returns
+    the job dict, updated in place if a usable description was found.
+    """
+    slug = company_slug(job.get("company", ""))
+    if not slug:
+        return job
+
+    for pattern in FALLBACK_ATS_URL_PATTERNS:
+        url = pattern.format(slug=slug)
+        r = safe_get(url, timeout=20)
+        if not r:
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["nav", "header", "footer", "script", "style", "aside"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+
+        if has_sufficient_description(text):
+            job["description"] = text[:4000]
+            log.info(f"  Fallback description fetched from {url}")
+            return job
+
+    return job
+
+
+def build_withheld_card_description(job):
+    """Card body for a job whose description was too thin/blocked to score."""
+    return f"""**Source:** {job['source']}
+**URL:** {job['url']}
+**Found:** {datetime.now().strftime('%Y-%m-%d')}
+
+---
+
+**Verdict:** Score withheld — description blocked
+**Score:** —
+**Salary:** {job.get('salary', 'Not listed')}
+**Location/Remote:** {job.get('location', 'Not specified')}
+
+**Next step:**
+Pull the full JD directly before this can be scored or applied to."""
 
 
 # ─────────────────────────────────────────────
@@ -867,7 +1409,7 @@ def search_gmail(service, query, max_results=50):
         return []
 
 
-def get_email_body(service, msg_id):
+def get_email_body(service, msg_id, max_length=6000):
     """
     Fetches the full plain-text body of an email.
     Falls back to snippet if body can't be extracted.
@@ -916,7 +1458,7 @@ def get_email_body(service, msg_id):
                 return ""
             text = extract_html(payload)
 
-        return text[:6000] if text else msg.get("snippet", "")
+        return text[:max_length] if text else msg.get("snippet", "")
 
     except Exception as e:
         log.warning(f"Could not fetch email body: {e}")
@@ -970,6 +1512,134 @@ application_received with high confidence, not no_change."""
     except Exception as e:
         log.warning(f"Could not classify email for {company}: {e}")
         return None
+
+
+def extract_reconciliation_info(service, email):
+    """
+    Used by the Gmail-Trello reconciliation job, where the company isn't
+    already known from a Trello card. One Claude call both identifies the
+    company/role this thread is about and classifies any status change,
+    so a thread that slipped past the per-company scan can still be
+    reconciled against the board.
+    """
+    client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
+
+    body = get_email_body(service, email["id"])
+    content_for_claude = body if body else email["snippet"]
+
+    prompt = f"""This email may be related to a job application. Identify what it's about.
+
+From: {email['from']}
+Subject: {email['subject']}
+Content: {content_for_claude[:3000]}
+
+Respond ONLY in valid JSON:
+{{
+  "is_job_related": true or false,
+  "company": "company name, or null if not identifiable",
+  "title": "job title, or null if not identifiable",
+  "status_change": "interview_scheduled | rejected | offer | info_requested | application_received | no_change",
+  "confidence": "high | medium | low",
+  "summary": "one sentence about what this email means",
+  "suggested_trello_list": "Interview | Rejected | Closed | Applied | null"
+}}
+
+If this email is not related to a specific job application (a job-alert
+digest, newsletter, spam, etc.), set is_job_related to false and leave
+company/title as null."""
+
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        log.warning(f"    Could not extract reconciliation info: {e}")
+        return None
+
+
+def match_target_list(suggested_list, list_map):
+    """
+    Case-insensitive, whitespace-tolerant match of a suggested list name
+    against the board's real lists, with a fuzzy substring fallback for
+    near-misses (e.g. "Interviewing" vs "Interview").
+    Returns (list_id, list_name), or (None, None) if nothing matched.
+    """
+    if not suggested_list:
+        return None, None
+    normalized_suggestion = suggested_list.strip().lower()
+
+    for list_name, list_id in list_map.items():
+        if list_name.strip().lower() == normalized_suggestion:
+            return list_id, list_name
+
+    for list_name, list_id in list_map.items():
+        if (normalized_suggestion in list_name.strip().lower()
+                or list_name.strip().lower() in normalized_suggestion):
+            log.info(f"    Fuzzy-matched '{suggested_list}' → '{list_name}'")
+            return list_id, list_name
+
+    return None, None
+
+
+# ─────────────────────────────────────────────
+# DAYS-TO-REJECTION TRACKING
+# When a rejection moves a card, look up how long it took from the
+# original application-confirmation email — minutes/hours reads as an
+# ATS keyword auto-reject, days reads as an actual human pass.
+# ─────────────────────────────────────────────
+
+APPLICATION_CONFIRMATION_SUBJECT_MARKERS = [
+    "application received", "thank you for applying", "thanks for applying",
+    "we received your application", "your application to", "application confirmation",
+]
+
+def find_application_date(service, company, lookback_days=180):
+    """
+    Best-effort search for the original application-confirmation email for
+    a company. Returns the earliest matching email's timestamp, or None.
+    """
+    query = f'"{company}" newer_than:{lookback_days}d'
+    emails = search_gmail(service, query, max_results=20)
+
+    candidates = []
+    for e in emails:
+        subject_lower = e.get("subject", "").lower()
+        if any(marker in subject_lower for marker in APPLICATION_CONFIRMATION_SUBJECT_MARKERS):
+            try:
+                candidates.append(parsedate_to_datetime(e["date"]))
+            except (TypeError, ValueError):
+                continue
+
+    return min(candidates) if candidates else None
+
+def append_turnaround_note(card_id, applied_date, rejected_date):
+    """Appends a rejection-speed note to a card's description."""
+    delta = rejected_date - applied_date
+    hours = delta.total_seconds() / 3600
+    days = delta.days
+
+    if hours < 0:
+        return  # rejection predates the application email we found — not trustworthy
+
+    if hours < 24:
+        speed_note = f"Rejected in {hours:.1f} hours — likely automated/ATS filter."
+    elif days <= 7:
+        speed_note = f"Rejected in {days} days — likely a real (if brisk) human review."
+    else:
+        speed_note = f"Rejected in {days} days — extended review process."
+
+    try:
+        current_desc = get_card_description(card_id)
+        update_card_description(card_id, f"{current_desc}\n\n**Turnaround:** {speed_note}")
+        log.info(f"    Turnaround note added: {speed_note}")
+    except Exception as e:
+        log.error(f"    Failed to append turnaround note: {e}")
 
 
 def run_gmail_scan():
@@ -1070,27 +1740,9 @@ def run_gmail_scan():
                 log.info(f"    [{company}] Skipping — no suggested list (likely no_change)")
                 continue
 
-            # Find the target list ID — case-insensitive, whitespace-tolerant match
-            target_list_id = None
-            matched_list_name = None
-            normalized_suggestion = suggested_list.strip().lower()
-            for list_name, list_id in list_map.items():
-                if list_name.strip().lower() == normalized_suggestion:
-                    target_list_id = list_id
-                    matched_list_name = list_name
-                    break
-
-            # Fuzzy fallback: handle "Interviewing" vs "Interview", etc.
-            if not target_list_id:
-                for list_name, list_id in list_map.items():
-                    if (normalized_suggestion in list_name.strip().lower()
-                            or list_name.strip().lower() in normalized_suggestion):
-                        target_list_id = list_id
-                        matched_list_name = list_name
-                        log.info(
-                            f"    [{company}] Fuzzy-matched '{suggested_list}' → '{list_name}'"
-                        )
-                        break
+            # Find the target list ID — case-insensitive, whitespace-tolerant,
+            # fuzzy-fallback match (e.g. "Interviewing" vs "Interview")
+            target_list_id, matched_list_name = match_target_list(suggested_list, list_map)
 
             if not target_list_id:
                 log.warning(
@@ -1123,6 +1775,19 @@ def run_gmail_scan():
                     f"({classification['summary']})"
                 )
                 moved += 1
+
+                # Rejections: look up the original application email and
+                # log how fast it came back (ATS-speed vs human review)
+                if matched_list_name == CONFIG["trello_lists"]["rejected"]:
+                    applied_date = find_application_date(service, company)
+                    if applied_date:
+                        try:
+                            rejected_date = parsedate_to_datetime(email["date"])
+                        except (TypeError, ValueError):
+                            rejected_date = datetime.now(timezone.utc)
+                        append_turnaround_note(card["id"], applied_date, rejected_date)
+                    else:
+                        log.info(f"    [{company}] Could not find original application email — skipping turnaround note")
             except Exception as e:
                 log.error(f"  Failed to move card for {company}: {e}")
 
@@ -1141,30 +1806,292 @@ def run_gmail_scan():
     seen = load_seen_jobs()
     watching_list_id = list_map.get(CONFIG["trello_lists"]["watching"])
     if watching_list_id:
-        idealist_cards = run_gmail_scan_idealist(service, seen, list_map, watching_list_id)
+        # Fetched once and shared across all three alert sources below so a
+        # repost that shows up in, say, both LinkedIn and Built In on the
+        # same day is only ever created as one card.
+        existing_cards = get_cards_for_duplicate_check(list_map)
+
+        idealist_cards = run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_cards)
         save_seen_jobs(seen)
         if idealist_cards:
             log.info(f"  {idealist_cards} new Idealist card(s) added to Watching")
-    else:
-        log.warning("Could not find Watching list — skipping Idealist Gmail scan")
 
-    # ── LinkedIn job alert emails ──
-    if watching_list_id:
-        linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id)
+        linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
         save_seen_jobs(seen)
         if linkedin_cards:
             log.info(f"  {linkedin_cards} new LinkedIn card(s) added to Watching")
 
-    # ── Built In job alert emails ──
-    if watching_list_id:
-        builtin_cards = run_gmail_scan_builtin(service, seen, list_map, watching_list_id)
+        builtin_cards = run_gmail_scan_builtin(service, seen, list_map, watching_list_id, existing_cards)
         save_seen_jobs(seen)
         if builtin_cards:
             log.info(f"  {builtin_cards} new Built In card(s) added to Watching")
+    else:
+        log.warning("Could not find Watching list — skipping alert-email Gmail scans")
+
+    # ── Gmail-Trello reconciliation ──
+    # Catches threads the per-company scan above misses entirely (it only
+    # searches from existing card names outward)
+    run_gmail_trello_reconciliation(service, list_map)
 
 
+def run_gmail_trello_reconciliation(service, list_map):
+    """
+    Searches broadly across known ATS senders/subjects instead of starting
+    from existing Trello cards, to catch threads the per-company scan in
+    run_gmail_scan() misses entirely. Never auto-creates a card for an
+    unmatched thread — it only flags orphan candidates for Jeff to confirm,
+    since backfilling wrong details is worse than not backfilling. A
+    matched thread whose status doesn't match the card's current list gets
+    auto-moved, same as the per-company sync (that part's already reliable
+    — the gap is missed threads, not incorrect moves).
+    """
+    log.info("=" * 50)
+    log.info("GMAIL-TRELLO RECONCILIATION")
+    log.info("=" * 50)
 
-def run_gmail_scan_idealist(service, seen, list_map, watching_list_id):
+    lookback = CONFIG["reconciliation_lookback_days"]
+    query = (
+        "(from:(greenhouse-mail.io OR applytojob.com OR ashbyhq.com OR "
+        "myworkday.com OR rippling.com) OR "
+        'subject:(application OR interview OR "thank you for applying")) '
+        f"newer_than:{lookback}d"
+    )
+    emails = search_gmail(service, query, max_results=100)
+
+    if not emails:
+        log.info("  No matching threads found.")
+        return
+
+    log.info(f"  Found {len(emails)} candidate thread(s) in the last {lookback} days")
+
+    seen_reconciliation = load_seen_reconciliation_emails()
+    orphan_candidates = load_orphan_candidates()
+    all_cards = get_all_board_cards(list_map)
+
+    scanned = 0
+    new_orphans = 0
+    corrected = 0
+
+    for email in emails:
+        if email["id"] in seen_reconciliation:
+            continue
+        scanned += 1
+
+        info = extract_reconciliation_info(service, email)
+        if not info:
+            seen_reconciliation[email["id"]] = {"failed": True, "date": datetime.now().isoformat()}
+            continue
+
+        if not info.get("is_job_related") or not info.get("company"):
+            seen_reconciliation[email["id"]] = {"not_job_related": True, "date": datetime.now().isoformat()}
+            continue
+
+        company = info["company"].strip()
+        title = (info.get("title") or "").strip()
+
+        match = is_likely_duplicate(company, title, all_cards)
+
+        if not match:
+            orphan_candidates[email["id"]] = {
+                "company": company,
+                "title":   title,
+                "subject": email["subject"],
+                "from":    email["from"],
+                "date":    email["date"],
+                "summary": info.get("summary", ""),
+                "flagged": datetime.now().isoformat(),
+            }
+            new_orphans += 1
+            log.warning(
+                f"    ORPHAN CANDIDATE: '{company} — {title}' "
+                f"('{email['subject']}') has no matching Trello card"
+            )
+            seen_reconciliation[email["id"]] = {"orphan": True, "date": datetime.now().isoformat()}
+            continue
+
+        # Matched an existing card — check for a stale-state mismatch
+        seen_reconciliation[email["id"]] = {
+            "matched_card_id": match["card_id"],
+            "date":            datetime.now().isoformat(),
+        }
+
+        if info.get("confidence") == "low":
+            continue
+
+        suggested_list = info.get("suggested_trello_list")
+        if not suggested_list or str(suggested_list).lower() == "null":
+            continue
+
+        target_list_id, matched_list_name = match_target_list(suggested_list, list_map)
+        if not target_list_id or matched_list_name == match["list_name"]:
+            continue
+
+        try:
+            move_trello_card(match["card_id"], target_list_id)
+            comment = (
+                f"Auto-moved by reconciliation sync on {datetime.now().strftime('%Y-%m-%d')}\n\n"
+                f"Email: {email['subject']}\n"
+                f"From: {email['from']}\n"
+                f"Summary: {info.get('summary', '')}"
+            )
+            add_comment_to_card(match["card_id"], comment)
+            log.info(
+                f"  ✓ Reconciliation moved '{match['company']} — {match['title']}' → "
+                f"{matched_list_name} ({info.get('summary', '')})"
+            )
+            corrected += 1
+
+            if matched_list_name == CONFIG["trello_lists"]["rejected"]:
+                applied_date = find_application_date(service, company)
+                if applied_date:
+                    try:
+                        rejected_date = parsedate_to_datetime(email["date"])
+                    except (TypeError, ValueError):
+                        rejected_date = datetime.now(timezone.utc)
+                    append_turnaround_note(match["card_id"], applied_date, rejected_date)
+        except Exception as e:
+            log.error(f"  Failed to move card for reconciliation match '{company}': {e}")
+
+    save_seen_reconciliation_emails(seen_reconciliation)
+    save_orphan_candidates(orphan_candidates)
+
+    log.info(
+        f"\nReconciliation complete. Scanned {scanned} new thread(s), "
+        f"{new_orphans} new orphan candidate(s) flagged "
+        f"({len(orphan_candidates)} pending review total), "
+        f"{corrected} stale-state mismatch(es) corrected."
+    )
+    if orphan_candidates:
+        log.info(
+            f"  Review pending orphan candidates in "
+            f"{CONFIG['orphan_candidates_file']} before creating any cards."
+        )
+
+
+# ─────────────────────────────────────────────
+# IDEALIST DIGEST SECTION SPLITTING
+# Idealist digests bundle multiple saved-search sections into one email,
+# each fully spelled out inline with its own "N new results found for
+# this search" count marker. A single whole-body extraction call was
+# silently discarding most of a large digest — both because the fetched
+# body itself was truncated (see IDEALIST_EMAIL_MAX_CHARS below) and
+# because one Claude call trying to list everything at once could get
+# cut off mid-output. Splitting per-section lets each chunk get its own
+# small, bounded extraction call instead.
+# ─────────────────────────────────────────────
+
+# Observed real digest: ~43,000 chars for 69 listings (~623 chars/listing,
+# including a long tracking-redirect URL per listing). 80,000 gives
+# headroom for 100+ listings in a single digest.
+IDEALIST_EMAIL_MAX_CHARS = 80_000
+
+_IDEALIST_SECTION_PATTERN = re.compile(
+    r'Here are your new updates for "(.+?)" jobs:(.*?)(\d+) new results? found for this search',
+    re.DOTALL
+)
+
+def split_into_search_sections(email_body):
+    """
+    Splits an Idealist digest into per-saved-search chunks.
+    Returns [] if the body doesn't match Idealist's standard digest
+    template — caller falls back to whole-body extraction in that case.
+    """
+    sections = []
+    for match in _IDEALIST_SECTION_PATTERN.finditer(email_body):
+        search_name, raw_text, stated_count = match.groups()
+        sections.append({
+            "search_name": search_name.strip(),
+            "raw_text": raw_text.strip(),
+            "stated_count": int(stated_count),
+        })
+    return sections
+
+def validate_extraction_completeness(listings, stated_count, search_name):
+    """
+    Compares extracted count against Idealist's own stated count for the
+    section — a free correctness check the digest format hands us.
+    Always logs on mismatch so truncation is loud, never silent.
+    """
+    if len(listings) != stated_count:
+        log.warning(
+            f"  Idealist section '{search_name}': extracted {len(listings)} "
+            f"listing(s) but Idealist states {stated_count} — possible truncation/omission"
+        )
+        return False
+    return True
+
+def extract_idealist_section_listings(client, subject, section):
+    """
+    Extracts listings from one Idealist digest section. Tells Claude the
+    expected count upfront (stronger than only checking after the fact).
+    Retries ONCE with an explicit "you missed some" instruction if the
+    count doesn't match; if still short after the retry, logs and
+    proceeds with whatever was extracted — no unbounded retry loop.
+    """
+    search_name = section["search_name"]
+    raw_text = section["raw_text"]
+    stated_count = section["stated_count"]
+
+    if stated_count == 0:
+        return []  # nothing to extract, skip the call entirely
+
+    prompt = f"""Extract job listings from this section of an Idealist job alert digest email.
+
+Digest subject: {subject}
+Saved search name: "{search_name}"
+This section contains exactly {stated_count} job listing(s). Extract ALL {stated_count} of them — do not stop early or summarize.
+
+Section content:
+{raw_text}
+
+Return ONLY a JSON array of job objects, with exactly {stated_count} entries.
+Each object should have:
+{{"title": "job title", "company": "organization name", "url": "job URL if visible or empty string"}}
+
+Return only the JSON array, no other text."""
+
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=6000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        listings = safe_parse_json_list(message.content[0].text.strip())
+    except Exception as e:
+        log.warning(f"  Could not parse Idealist section '{search_name}': {e}")
+        return []
+
+    if validate_extraction_completeness(listings, stated_count, search_name):
+        return listings
+
+    retry_prompt = f"""Your previous extraction of the "{search_name}" section returned {len(listings)} listing(s), but this section contains exactly {stated_count} listings — you missed some.
+
+Section content:
+{raw_text}
+
+Extract EVERY SINGLE job listing in this section. There should be exactly {stated_count} objects in your output. Double-check you have not skipped or merged any listings.
+
+Return ONLY a JSON array of job objects:
+{{"title": "job title", "company": "organization name", "url": "job URL if visible or empty string"}}
+
+Return only the JSON array, no other text."""
+
+    try:
+        retry_message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=6000,
+            messages=[{"role": "user", "content": retry_prompt}],
+        )
+        retry_listings = safe_parse_json_list(retry_message.content[0].text.strip())
+    except Exception as e:
+        log.warning(f"  Retry failed for Idealist section '{search_name}': {e}")
+        return listings  # keep the original partial result
+
+    validate_extraction_completeness(retry_listings, stated_count, search_name)  # logs again if still short
+    return retry_listings
+
+
+def run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_cards):
     """
     Scans Gmail for Idealist job alert emails, extracts job listings,
     scores them with Claude, and creates Trello cards for strong matches.
@@ -1199,12 +2126,25 @@ def run_gmail_scan_idealist(service, seen, list_map, watching_list_id):
     cards_created = 0
 
     for email in emails:
-        # Use Claude to extract job listings from the email snippet
-        # Fetch full email body for accurate job extraction
-        body = get_email_body(service, email['id'])
+        # Fetch the full email body — Idealist digests bundle multiple
+        # saved-search sections into one email, so a much higher cap than
+        # the default is used here (see IDEALIST_EMAIL_MAX_CHARS)
+        body = get_email_body(service, email['id'], max_length=IDEALIST_EMAIL_MAX_CHARS)
         content_for_claude = body if body else email['snippet']
 
-        prompt = f"""Extract job listings from this Idealist job alert email.
+        sections = split_into_search_sections(content_for_claude)
+
+        listings = []
+        if sections:
+            log.info(f"  Digest split into {len(sections)} saved-search section(s)")
+            for section in sections:
+                listings.extend(extract_idealist_section_listings(client, email['subject'], section))
+        else:
+            # Fallback: unrecognized digest format — whole-body extraction,
+            # with a raised max_tokens as cheap insurance even though this
+            # is no longer the primary path
+            log.info("  Digest did not match expected section format — using whole-body fallback extraction")
+            prompt = f"""Extract job listings from this Idealist job alert email.
 
 Subject: {email['subject']}
 Content: {content_for_claude}
@@ -1217,17 +2157,16 @@ Example: [{{"title": "IT Manager", "company": "ACLU", "url": "https://www.ideali
 
 Return only the JSON array, no other text."""
 
-        try:
-            message = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text.strip()
-            listings = safe_parse_json_list(raw)
-        except Exception as e:
-            log.warning(f"  Could not parse Idealist email: {e}")
-            continue
+            try:
+                message = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                listings = safe_parse_json_list(message.content[0].text.strip())
+            except Exception as e:
+                log.warning(f"  Could not parse Idealist email: {e}")
+                continue
 
         if not listings:
             continue
@@ -1269,6 +2208,26 @@ Return only the JSON array, no other text."""
                 seen[fp] = {"verdict": "Pre-filtered", "date": datetime.now().isoformat()}
                 continue
 
+            # Description completeness gate — don't let a blocked/thin
+            # description produce a confident-looking numeric score
+            if not has_sufficient_description(job.get("description", "")):
+                job = attempt_fallback_description(job)
+
+            if not has_sufficient_description(job.get("description", "")):
+                log.info(f"  Description blocked/thin for {title} at {company} — withholding score")
+                card_desc = build_withheld_card_description(job)
+                if create_card_or_note_duplicate(
+                    existing_cards, watching_list_id, company, title, card_desc, job["source"]
+                ):
+                    cards_created += 1
+                seen[fp] = {
+                    "company": company,
+                    "title":   title,
+                    "verdict": "Score withheld",
+                    "date":    datetime.now().isoformat(),
+                }
+                continue
+
             # Score with Claude
             result = score_job_with_claude(job)
             if not result:
@@ -1292,41 +2251,12 @@ Return only the JSON array, no other text."""
             if disqualified or score < CONFIG["min_score_for_card"]:
                 continue
 
-            # Create Trello card
-            card_name = f"{company} — {title}"
-            card_desc = f"""**Source:** Idealist (Gmail alert)
-**URL:** {url or 'Search idealist.org'}
-**Found:** {datetime.now().strftime('%Y-%m-%d')}
-
----
-
-**Verdict:** {verdict} | **Score:** {score}/100
-**Lane:** {result.get('lane', '?')}
-**Mission fit:** {result.get('mission_fit', '?')}
-**Salary ask:** {result.get('salary_ask', '?')}
-
-**Why it fits:**
-{result.get('why_it_fits', '—')}
-
-**Concerns:**
-{result.get('concerns', '—')}
-
-**Cover letter angle:**
-{result.get('cover_letter_angle', '—')}
-
-**Next step:**
-{result.get('next_step', '—')}
-
-**Puzzle fit:** {'✓ Yes' if result.get('puzzle_fit') else '—'}
-**Environment flags:** {', '.join(result.get('environment_flags', [])) or '—'}
-**Portfolio piece:** *(add relevant RWA / email triage / job pipeline case study here)*"""
-
-            try:
-                create_trello_card(watching_list_id, card_name, card_desc)
-                log.info(f"  ✓ Trello card created for {card_name}")
+            # Create Trello card (checks for duplicates/reposts first)
+            card_desc = build_scored_card_description(job, result)
+            if create_card_or_note_duplicate(
+                existing_cards, watching_list_id, company, title, card_desc, job["source"]
+            ):
                 cards_created += 1
-            except Exception as e:
-                log.error(f"  Failed to create card for {card_name}: {e}")
 
             time.sleep(1)
 
@@ -1334,7 +2264,7 @@ Return only the JSON array, no other text."""
     return cards_created
 
 
-def run_gmail_scan_linkedin(service, seen, list_map, watching_list_id):
+def run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards):
     """
     Scans Gmail for LinkedIn job alert emails and creates Trello cards.
 
@@ -1446,6 +2376,27 @@ Extract every job listing you can find. Return only the JSON array, no other tex
                 seen[fp] = {"verdict": "Pre-filtered", "date": datetime.now().isoformat()}
                 continue
 
+            # Description completeness gate — LinkedIn alerts frequently
+            # resolve to a login-walled/empty description. Don't let that
+            # produce a confident-looking numeric score.
+            if not has_sufficient_description(job.get("description", "")):
+                job = attempt_fallback_description(job)
+
+            if not has_sufficient_description(job.get("description", "")):
+                log.info(f"  Description blocked/thin for {title} at {company} — withholding score")
+                card_desc = build_withheld_card_description(job)
+                if create_card_or_note_duplicate(
+                    existing_cards, watching_list_id, company, title, card_desc, job["source"]
+                ):
+                    cards_created += 1
+                seen[fp] = {
+                    "company": company,
+                    "title":   title,
+                    "verdict": "Score withheld",
+                    "date":    datetime.now().isoformat(),
+                }
+                continue
+
             result = score_job_with_claude(job)
             if not result:
                 seen[fp] = {"scored": False, "date": datetime.now().isoformat()}
@@ -1468,40 +2419,11 @@ Extract every job listing you can find. Return only the JSON array, no other tex
             if disqualified or score < CONFIG["min_score_for_card"]:
                 continue
 
-            card_name = f"{company} — {title}"
-            card_desc = f"""**Source:** LinkedIn (Gmail alert)
-**URL:** {url or 'Search linkedin.com/jobs'}
-**Found:** {datetime.now().strftime('%Y-%m-%d')}
-
----
-
-**Verdict:** {verdict} | **Score:** {score}/100
-**Lane:** {result.get('lane', '?')}
-**Mission fit:** {result.get('mission_fit', '?')}
-**Salary ask:** {result.get('salary_ask', '?')}
-
-**Why it fits:**
-{result.get('why_it_fits', '—')}
-
-**Concerns:**
-{result.get('concerns', '—')}
-
-**Cover letter angle:**
-{result.get('cover_letter_angle', '—')}
-
-**Next step:**
-{result.get('next_step', '—')}
-
-**Puzzle fit:** {'✓ Yes' if result.get('puzzle_fit') else '—'}
-**Environment flags:** {', '.join(result.get('environment_flags', [])) or '—'}
-**Portfolio piece:** *(add relevant RWA / email triage / job pipeline case study here)*"""
-
-            try:
-                create_trello_card(watching_list_id, card_name, card_desc)
-                log.info(f"  ✓ Trello card created for {card_name}")
+            card_desc = build_scored_card_description(job, result)
+            if create_card_or_note_duplicate(
+                existing_cards, watching_list_id, company, title, card_desc, job["source"]
+            ):
                 cards_created += 1
-            except Exception as e:
-                log.error(f"  Failed to create card for {card_name}: {e}")
 
             time.sleep(1)
 
@@ -1509,7 +2431,7 @@ Extract every job listing you can find. Return only the JSON array, no other tex
     return cards_created
 
 
-def run_gmail_scan_builtin(service, seen, list_map, watching_list_id):
+def run_gmail_scan_builtin(service, seen, list_map, watching_list_id, existing_cards):
     """
     Scans Gmail for Built In job alert emails and creates Trello cards.
 
@@ -1619,6 +2541,26 @@ Extract every job listing you can find. Return only the JSON array, no other tex
                 seen[fp] = {"verdict": "Pre-filtered", "date": datetime.now().isoformat()}
                 continue
 
+            # Description completeness gate — don't let a blocked/thin
+            # description produce a confident-looking numeric score
+            if not has_sufficient_description(job.get("description", "")):
+                job = attempt_fallback_description(job)
+
+            if not has_sufficient_description(job.get("description", "")):
+                log.info(f"  Description blocked/thin for {title} at {company} — withholding score")
+                card_desc = build_withheld_card_description(job)
+                if create_card_or_note_duplicate(
+                    existing_cards, watching_list_id, company, title, card_desc, job["source"]
+                ):
+                    cards_created += 1
+                seen[fp] = {
+                    "company": company,
+                    "title":   title,
+                    "verdict": "Score withheld",
+                    "date":    datetime.now().isoformat(),
+                }
+                continue
+
             result = score_job_with_claude(job)
             if not result:
                 seen[fp] = {"scored": False, "date": datetime.now().isoformat()}
@@ -1641,40 +2583,11 @@ Extract every job listing you can find. Return only the JSON array, no other tex
             if disqualified or score < CONFIG["min_score_for_card"]:
                 continue
 
-            card_name = f"{company} — {title}"
-            card_desc = f"""**Source:** Built In (Gmail alert)
-**URL:** {url or 'Search builtin.com/jobs'}
-**Found:** {datetime.now().strftime('%Y-%m-%d')}
-
----
-
-**Verdict:** {verdict} | **Score:** {score}/100
-**Lane:** {result.get('lane', '?')}
-**Mission fit:** {result.get('mission_fit', '?')}
-**Salary ask:** {result.get('salary_ask', '?')}
-
-**Why it fits:**
-{result.get('why_it_fits', '—')}
-
-**Concerns:**
-{result.get('concerns', '—')}
-
-**Cover letter angle:**
-{result.get('cover_letter_angle', '—')}
-
-**Next step:**
-{result.get('next_step', '—')}
-
-**Puzzle fit:** {'✓ Yes' if result.get('puzzle_fit') else '—'}
-**Environment flags:** {', '.join(result.get('environment_flags', [])) or '—'}
-**Portfolio piece:** *(add relevant RWA / email triage / job pipeline case study here)*"""
-
-            try:
-                create_trello_card(watching_list_id, card_name, card_desc)
-                log.info(f"  ✓ Trello card created for {card_name}")
+            card_desc = build_scored_card_description(job, result)
+            if create_card_or_note_duplicate(
+                existing_cards, watching_list_id, company, title, card_desc, job["source"]
+            ):
                 cards_created += 1
-            except Exception as e:
-                log.error(f"  Failed to create card for {card_name}: {e}")
 
             time.sleep(1)
 
@@ -1717,6 +2630,10 @@ def run_job_crawl():
         log.error(f"Could not find '{CONFIG['trello_lists']['watching']}' list on Trello board.")
         return
 
+    # Existing pipeline cards, for fuzzy duplicate/repost detection before
+    # any new card gets created
+    existing_cards = get_cards_for_duplicate_check(list_map)
+
     # Run all crawlers
     all_jobs = []
     all_jobs.extend(crawl_idealist())
@@ -1743,6 +2660,7 @@ def run_job_crawl():
     cards_created = 0
     cards_skipped = 0
     pre_filtered = 0
+    withheld = 0
     errors = 0
 
     for fp, job in new_jobs:
@@ -1763,10 +2681,34 @@ def run_job_crawl():
             pre_filtered += 1
             continue
 
-        log.info(f"  Sending to Claude ({reason})...")
-
         # Enrich description if short
         job = enrich_job_description(job)
+
+        # Description completeness gate — don't let a blocked/thin
+        # description produce a confident-looking numeric score
+        if not has_sufficient_description(job.get("description", "")):
+            job = attempt_fallback_description(job)
+
+        if not has_sufficient_description(job.get("description", "")):
+            log.info(f"  Description blocked/thin — withholding score")
+            card_desc = build_withheld_card_description(job)
+            if create_card_or_note_duplicate(
+                existing_cards, watching_list_id, job["company"], job["title"], card_desc, job["source"]
+            ):
+                cards_created += 1
+            seen[fp] = {
+                "company": job["company"],
+                "title":   job["title"],
+                "verdict": "Score withheld",
+                "date":    datetime.now().isoformat(),
+            }
+            withheld += 1
+            if cards_created % 5 == 0:
+                save_seen_jobs(seen)
+            time.sleep(1)
+            continue
+
+        log.info(f"  Sending to Claude ({reason})...")
 
         # Score with Claude
         result = score_job_with_claude(job)
@@ -1803,42 +2745,12 @@ def run_job_crawl():
             cards_skipped += 1
             continue
 
-        # Build Trello card
-        card_name = f"{job['company']} — {job['title']}"
-        card_desc = f"""**Source:** {job['source']}
-**URL:** {job['url']}
-**Found:** {datetime.now().strftime('%Y-%m-%d')}
-
----
-
-**Verdict:** {verdict} | **Score:** {score}/100
-**Lane:** {result.get('lane', '?')}
-**Mission fit:** {result.get('mission_fit', '?')}
-**Salary ask:** {result.get('salary_ask', '?')}
-
-**Why it fits:**
-{result.get('why_it_fits', '—')}
-
-**Concerns:**
-{result.get('concerns', '—')}
-
-**Cover letter angle:**
-{result.get('cover_letter_angle', '—')}
-
-**Next step:**
-{result.get('next_step', '—')}
-
-**Puzzle fit:** {'✓ Yes' if result.get('puzzle_fit') else '—'}
-**Environment flags:** {', '.join(result.get('environment_flags', [])) or '—'}
-**Portfolio piece:** *(add relevant RWA / email triage / job pipeline case study here)*"""
-
-        try:
-            card = create_trello_card(watching_list_id, card_name, card_desc)
-            log.info(f"  ✓ Trello card created → Watching ({card.get('url', '')})")
+        # Build Trello card (checks for duplicates/reposts first)
+        card_desc = build_scored_card_description(job, result)
+        if create_card_or_note_duplicate(
+            existing_cards, watching_list_id, job["company"], job["title"], card_desc, job["source"]
+        ):
             cards_created += 1
-        except Exception as e:
-            log.error(f"  Failed to create Trello card: {e}")
-            errors += 1
 
         # Save cache periodically
         if cards_created % 5 == 0:
@@ -1854,11 +2766,12 @@ def run_job_crawl():
     log.info(f"  Jobs found:       {len(all_jobs)}")
     log.info(f"  New this run:     {len(new_jobs)}")
     log.info(f"  Pre-filtered:     {pre_filtered}  (no Claude call)")
-    log.info(f"  Sent to Claude:   {len(new_jobs) - pre_filtered}")
+    log.info(f"  Score withheld:   {withheld}  (blocked/thin description)")
+    log.info(f"  Sent to Claude:   {len(new_jobs) - pre_filtered - withheld}")
     log.info(f"  Cards created:    {cards_created}")
     log.info(f"  Below threshold:  {cards_skipped}")
     log.info(f"  Errors:           {errors}")
-    log.info(f"  Est. API cost:    ~${((len(new_jobs) - pre_filtered) * 0.003):.3f}")
+    log.info(f"  Est. API cost:    ~${((len(new_jobs) - pre_filtered - withheld) * 0.003):.3f}")
     log.info("=" * 50)
 
 
@@ -1870,6 +2783,7 @@ def main():
     parser = argparse.ArgumentParser(description="Jeff's Job Search Agent")
     parser.add_argument("--crawl",       action="store_true", help="Run job crawl only")
     parser.add_argument("--gmail",       action="store_true", help="Run Gmail scan only")
+    parser.add_argument("--reconcile",   action="store_true", help="Run Gmail-Trello reconciliation only")
     parser.add_argument("--gmail-setup", action="store_true", help="Run Gmail OAuth setup")
     args = parser.parse_args()
 
@@ -1884,6 +2798,13 @@ def main():
         run_job_crawl()
     elif args.gmail:
         run_gmail_scan()
+    elif args.reconcile:
+        service = get_gmail_service()
+        if not service:
+            log.error("Could not connect to Gmail. Run --gmail-setup first.")
+            return
+        list_map = get_trello_lists()
+        run_gmail_trello_reconciliation(service, list_map)
     else:
         # Default: run both
         run_job_crawl()

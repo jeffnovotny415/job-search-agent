@@ -8,6 +8,9 @@ profile.txt
 
 # Runtime files — local only
 seen_jobs.json
+seen_emails.json
+seen_reconciliation_emails.json
+orphan_candidates.json
 job_agent.log
 
 # Python
