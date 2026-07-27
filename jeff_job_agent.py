@@ -217,7 +217,7 @@ TITLE_BLOCKLIST = [
     "security engineer", "penetration tester", "blockchain", "crypto",
     "web3", "defi", "nft", "content writer", "copywriter", "social media",
     "seo specialist", "paid media", "field technician", "field service",
-    "warehouse", "driver", "logistics coordinator",
+    "field consultant", "warehouse", "driver", "logistics coordinator",
 ]
 
 # Titles containing at least one of these suggest
@@ -255,6 +255,7 @@ DESCRIPTION_BLOCKLIST = [
     "must be onsite", "required to be in office",
     "5 days a week in office", "four days in office",
     "relocation required",
+    "duty station", "local hire", "locally hired",
 ]
 
 
@@ -264,6 +265,7 @@ def pre_filter(job):
     True = send to Claude. False = skip, save the API call.
 
     Logic:
+    0. Block if company matches a known non-remote-US organization
     1. Block if title matches a hard blocklist term
     2. Pass if title matches an allowlist term
     3. If title is ambiguous, check description for disqualifiers
@@ -272,6 +274,16 @@ def pre_filter(job):
     """
     title = job.get("title", "").lower()
     description = job.get("description", "").lower()
+    company = job.get("company", "").lower()
+
+    # Hard block on known-non-remote-US organizations, regardless of title
+    # or how the description reads. See COMPANY_HARD_BLOCKLIST comment.
+    # Word-boundary match, not bare substring — "brac" as a substring also
+    # matches inside "Embrace", which would silently skip any unrelated
+    # company with "Embrace" in its name.
+    for term in COMPANY_HARD_BLOCKLIST:
+        if re.search(rf"\b{re.escape(term)}\b", company):
+            return False, f"company blocklist: '{term}'"
 
     # Hard block on title — these are almost never a fit
     for term in TITLE_BLOCKLIST:
@@ -288,8 +300,18 @@ def pre_filter(job):
             return True, "title allowlist match"
 
     # Ambiguous title — check description for positive signals
+    # NOTE: "remote" was removed from this list. It was meant as a signal
+    # for remote-friendly roles, but as a bare substring match against the
+    # full description text it fires just as often on phrases like "remote
+    # schools," "remote communities," or "remote regions" (common in
+    # international development / NGO postings) as it does on actual
+    # remote-work language. That made it a false-positive magnet rather
+    # than a useful signal — it was making international, non-remote
+    # postings (BRAC, GIGA, etc.) MORE likely to pass, not less. Remote
+    # eligibility is checked separately via location field + hard
+    # disqualifier patterns below, not as a role-fit keyword here.
     positive_signals = [
-        "remote", "project management", "operations", "saas", "technical",
+        "project management", "operations", "saas", "technical",
         "it ", " it,", "systems", "implementation", "workflow", "automation",
         "infrastructure", "platform", "program management",
     ]
@@ -677,7 +699,28 @@ HARD_DISQUALIFIER_PATTERNS = {
         # how the confirmed United Way of Greater LA JD stated it.
         r"\boffice\b.{0,80}\b(mondays?|tuesdays?|wednesdays?|thursdays?|fridays?)\b",
     ],
+    # International development / NGO postings (BRAC, GIGA/UNICEF, USAID
+    # contractors, etc.) almost never say "hybrid" or "onsite" — they use
+    # duty-station and work-authorization language instead. Added after
+    # BRAC (Bangladesh-headquartered, country-office postings) and a
+    # UNICEF/ITU Giga role both sailed through the filter untouched.
+    "non-US location required": [
+        r"\bduty station\b", r"\blocal(?:ly)?\s*hired?\b",
+        r"\bmust be (?:based|located|resident)\s+in\b(?!.{0,25}\bunited states\b)",
+        r"\bwork permit (?:for|in)\b", r"\bnational of\b.{0,20}\bcountry\b",
+        r"\bright to work in\b(?!.{0,25}\bunited states\b)",
+        r"\bcandidates? (?:must|should) reside in\b(?!.{0,25}\bunited states\b)",
+    ],
 }
+
+# Organizations whose open roles are structurally non-remote-US even when
+# the aggregator source doesn't say so (regional/country-office hires,
+# in-country field roles, etc). Checked against the job's company field.
+# Add to this list as new repeat offenders show up.
+COMPANY_HARD_BLOCKLIST = [
+    "brac", "giga", "unicef", "chemonics", "rti international",
+    "fhi 360", "forest service international foundation",
+]
 
 def scan_for_hard_disqualifiers(jd_text):
     """Returns list of triggered category names, empty if none."""
@@ -905,6 +948,7 @@ def crawl_remote_impact():
                 # Try to find title and company
                 title_el = card.select_one("h2, h3, .job-title, .title")
                 company_el = card.select_one(".company, .organization, .employer")
+                location_el = card.select_one(".location, [class*='location'], [class*='Location']")
                 link_el = card.select_one("a") if card.name != "a" else card
 
                 title = title_el.get_text(strip=True) if title_el else card.get_text(strip=True)[:80]
@@ -920,11 +964,19 @@ def crawl_remote_impact():
                     continue
                 seen_urls.add(href)
 
+                # Don't just trust the site's own "remote jobs" branding —
+                # read the card's actual location text if present. Only
+                # fall back to "Remote" (this site's default assumption)
+                # when no location element is found at all. This is what
+                # would have caught the dcbel listing (Montreal, Canada)
+                # that got labeled "Remote" purely because of the source.
+                location = location_el.get_text(strip=True) if location_el else "Remote"
+
                 jobs.append({
                     "company":     company,
                     "title":       title,
                     "url":         href,
-                    "location":    "Remote",
+                    "location":    location,
                     "salary":      "Not listed",
                     "description": card.get_text(separator=" ", strip=True)[:2000],
                     "source":      "Remote Impact",
@@ -1064,10 +1116,18 @@ def crawl_tech_jobs_for_good():
 KNOWN_NAME_ALIASES = {
     "codepath": "CodePath",
     "digital nest": "Digital Nest",
+    "betanyc": "BetaNYC",
 }
 
 def clean_ffwd_company_name(raw_name):
-    """Strips FFWD's internal disambiguation suffix ('... Org N' or trailing ' N')."""
+    """Strips FFWD's internal disambiguation suffix ('... Org N' or trailing
+    ' N'). NOTE: 'Org' here is very likely a slugified '.org' TLD fragment
+    (e.g. codepath.org -> 'codepath-org') combined with FFWD's own
+    disambiguation index, not a generic word FFWD inserts. Stripping both
+    together still produces the correct bare name in every case observed
+    so far, but if a future company's genuine name ends in the literal word
+    'Org', this would incorrectly truncate it — worth a spot-check if that
+    ever looks wrong."""
     cleaned = re.sub(r"\s+Org\s+\d+$", "", raw_name or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+\d+$", "", cleaned)
     return cleaned.strip()
@@ -1085,26 +1145,54 @@ def clean_company_name(name):
     return apply_known_alias(clean_ffwd_company_name(name))
 
 def extract_company_from_ffwd_url(url):
-    """Pulls the company slug out of an FFWD URL, e.g.
-    jobs.ffwd.org/companies/codepath-org-2-a1b2c3d4-.../jobs/... -> 'CodePath'
-    """
-    match = re.search(r"/companies/([a-z0-9-]+?)-[0-9a-f]{8}-", url)
+    """Pulls the company slug out of an FFWD URL. Handles both slug shapes
+    observed in the wild: with a trailing UUID (codepath-org-2-50165d4f-...)
+    and without one (betanyc-2, givedirectly-3)."""
+    match = re.search(r"/companies/([a-z0-9-]+?)/jobs/", url)
     if not match:
         return None
     slug = match.group(1)
+    # Strip a trailing UUID segment if present (8-4-4-4-12 hex, hyphenated)
+    slug = re.sub(
+        r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "", slug
+    )
     humanized = " ".join(word.capitalize() for word in slug.split("-"))
     return clean_company_name(humanized)
 
 def extract_company_from_title(page_title):
-    """Matches Greenhouse's standard auto-generated title format."""
-    match = re.search(r"Job Application for .+ at (.+)$", page_title or "")
-    return clean_company_name(match.group(1).strip()) if match else None
+    """Tries both known title formats: Greenhouse-hosted pages
+    ("Job Application for X at Y") and FFWD's own native template
+    ("Y - Tech Nonprofit Job Board")."""
+    if not page_title:
+        return None
+
+    match = re.search(r"Job Application for .+ at (.+)$", page_title)
+    if match:
+        return clean_company_name(match.group(1).strip())
+
+    match = re.search(r"^(.+?) - Tech Nonprofit Job Board$", page_title)
+    if match:
+        return clean_company_name(match.group(1).strip())
+
+    return None
 
 def backfill_ffwd_company(job):
     """
     If the listing-card scrape came back without a usable company name,
     recover it from the URL slug (primary — doesn't depend on page
     metadata, can't fail silently) or the page's <title> tag (fallback).
+
+    Known gap, not fixed here: some FFWD listings (confirmed: BRAC's
+    "Deputy Manager, Sub-Grants (SHIFT)") redirect straight to an external
+    career site (e.g. careers.brac.net/...) rather than a jobs.ffwd.org
+    URL. Neither method below can recover a company name in that case —
+    there's no FFWD company-slug structure to parse and no FFWD-hosted
+    page to fetch a <title> from. The real fix would need to happen
+    upstream in crawl_ffwd(), reading the company name directly off the
+    search-results-page listing card before the external link is ever
+    followed. Tracked here, not fixed — needs its own look at that page's
+    HTML structure first.
     """
     if job.get("company") and job["company"] not in ("", "Unknown", "See posting"):
         return job
@@ -1188,10 +1276,12 @@ def crawl_ffwd():
             try:
                 title_el = card.select_one("h2, h3, [class*='title'], [class*='Title']")
                 company_el = card.select_one("[class*='company'], [class*='Company'], [class*='org']")
+                location_el = card.select_one("[class*='location'], [class*='Location']")
                 link_el = card.select_one("a") if card.name != "a" else card
 
                 title = title_el.get_text(strip=True) if title_el else ""
                 company = company_el.get_text(strip=True) if company_el else "Unknown"
+                location = location_el.get_text(strip=True) if location_el else "See posting"
                 href = link_el.get("href", "") if link_el else ""
 
                 if not href or not title:
@@ -1206,7 +1296,7 @@ def crawl_ffwd():
                     "company":     company,
                     "title":       title,
                     "url":         href,
-                    "location":    "See posting",
+                    "location":    location,
                     "salary":      "Not listed",
                     "description": card.get_text(separator=" ", strip=True)[:2000],
                     "source":      "FFWD Jobs",
