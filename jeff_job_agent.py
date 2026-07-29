@@ -258,6 +258,108 @@ DESCRIPTION_BLOCKLIST = [
     "duty station", "local hire", "locally hired",
 ]
 
+# ─────────────────────────────────────────────
+# OCCUPATION / TITLE MISMATCH FILTER
+# Blocks blue-collar, manual-labor, field-operations, and other job titles
+# that fall outside Jeff's lanes REGARDLESS of mission-vertical keyword
+# hits — a Forklift Operator posting at a food-security nonprofit is still
+# a forklift operator role. Runs on the job TITLE only, not description
+# text, since mission-aligned orgs will legitimately mention e.g. "food
+# distribution" in a program-ops job description without the role itself
+# being that job.
+# ─────────────────────────────────────────────
+
+BLOCKED_TITLE_PATTERNS = [
+    r"\bforklift\b", r"\bdriver\b", r"\bwarehouse\b", r"\bmechanic\b",
+    r"\bpipe ?fitter\b", r"\bplumber\b", r"\bfront desk\b", r"\bcashier\b",
+    r"\bjanitor\b", r"\bcustodian\b", r"\bsecurity guard\b",
+    r"\bfarm ?(hand|worker)\b", r"\bagro\b", r"\bfield (officer|associate|worker|agent)\b",
+    r"\bdairy\b", r"\bconstruction\b", r"\bwelder\b", r"\bnurse\b",
+]
+_BLOCKED_TITLE_RE = re.compile("|".join(BLOCKED_TITLE_PATTERNS), re.IGNORECASE)
+
+# "distribution" + a role word, in EITHER order. The real motivating
+# example ("Associate Officer, Distribution") has the role word first,
+# comma-separated, with "distribution" last — a fixed "distribution
+# <role>" pattern misses it entirely (confirmed by testing).
+_DISTRIBUTION_ROLE_WORDS = r"(assistant|associate|officer|in-?charge)"
+_DISTRIBUTION_RE = re.compile(
+    rf"\bdistribution\b.{{0,30}}\b{_DISTRIBUTION_ROLE_WORDS}\b"
+    rf"|\b{_DISTRIBUTION_ROLE_WORDS}\b.{{0,30}}\bdistribution\b",
+    re.IGNORECASE,
+)
+
+# Trade/technical titles that need a protective exception: block only if
+# the base word is present AND none of its protective qualifier words
+# appear ANYWHERE in the title. Checked order-independently (not just
+# "does the qualifier follow the base word") because standard title
+# phrasing usually puts the qualifier BEFORE the base word — "IT
+# Technician," not "Technician IT" — and a direction-sensitive lookahead
+# would incorrectly block exactly the titles it's meant to protect
+# (confirmed by testing: a lookahead-only version blocked "IT Technician,"
+# "Network Technician," and "Help Desk Technician" outright).
+_PROTECTED_OCCUPATION_TERMS = [
+    (r"\belectrician\b", r"\bmanager\b"),
+    (r"\btechnician\b", r"\b(it|systems|network|help ?desk)\b"),
+    (r"\bteacher\b", r"\b(coach|coordinator)\b"),
+]
+
+def is_occupation_mismatch(job_title):
+    """
+    Returns True if the job title matches a known-mismatch occupation
+    category (blue-collar/manual-labor/field-operations titles outside
+    Jeff's lanes). Call this BEFORE scoring — if True, skip the card
+    entirely rather than scoring it.
+    """
+    if not job_title:
+        return False
+    title = job_title.lower()
+
+    if _BLOCKED_TITLE_RE.search(title):
+        return True
+    if _DISTRIBUTION_RE.search(title):
+        return True
+    for base_pattern, protective_pattern in _PROTECTED_OCCUPATION_TERMS:
+        if re.search(base_pattern, title) and not re.search(protective_pattern, title):
+            return True
+
+    return False
+
+# ─────────────────────────────────────────────
+# EXPANDED DEFENSE / AEROSPACE CONTRACTOR DETECTION
+# Matches on employer name — primary defense primes plus the major
+# "Beltway bandit" IT/services contractors that work overwhelmingly with
+# DoD/intelligence-community clients. This is separate from the existing
+# HARD_DISQUALIFIER_PATTERNS "defense/aerospace" category (JD-text jargon
+# like "DoD"/"classified"/"ITAR"), which misses postings whose JD simply
+# doesn't happen to use those words even though the employer itself is
+# unambiguous — e.g. a GDIT posting that just says "federal cloud
+# modernization" without ever saying "classified."
+# ─────────────────────────────────────────────
+
+DEFENSE_CONTRACTOR_PATTERNS = [
+    r"\bgeneral dynamics\b", r"\bgdit\b", r"\blockheed martin\b",
+    r"\bnorthrop grumman\b", r"\braytheon\b", r"\brtx corp(oration)?\b",
+    r"\bboeing defense\b", r"\bl3 ?harris\b", r"\bbae systems\b",
+    r"\bleidos\b", r"\bsaic\b", r"\bcaci\b", r"\bbooz allen\b",
+    r"\bparsons corp(oration)?\b", r"\bperaton\b", r"\bamentum\b",
+    r"\bkbr\b", r"\banduril\b",
+    r"\bpalantir\b",  # commercial + heavy defense/intel contracts — flagged
+                      # as possibly too aggressive; revisit if it costs a
+                      # role Jeff would've actually wanted considered
+]
+_DEFENSE_CONTRACTOR_RE = re.compile("|".join(DEFENSE_CONTRACTOR_PATTERNS), re.IGNORECASE)
+
+def is_defense_contractor(employer_name):
+    """
+    Returns True if the employer name matches a known defense/aerospace
+    contractor or subsidiary. Call this BEFORE scoring, as a hard
+    disqualifier alongside the existing NGO/non-US-org company blocklist.
+    """
+    if not employer_name:
+        return False
+    return bool(_DEFENSE_CONTRACTOR_RE.search(employer_name.lower()))
+
 
 def pre_filter(job):
     """
@@ -265,8 +367,10 @@ def pre_filter(job):
     True = send to Claude. False = skip, save the API call.
 
     Logic:
-    0. Block if company matches a known non-remote-US organization
-    1. Block if title matches a hard blocklist term
+    0. Block if company matches a known non-remote-US organization or
+       defense/aerospace contractor
+    1. Block if title matches a hard blocklist term or occupation-mismatch
+       pattern (blue-collar/manual-labor titles, regardless of company)
     2. Pass if title matches an allowlist term
     3. If title is ambiguous, check description for disqualifiers
     4. Default to sending to Claude when uncertain — better to
@@ -285,10 +389,32 @@ def pre_filter(job):
         if re.search(rf"\b{re.escape(term)}\b", company):
             return False, f"company blocklist: '{term}'"
 
+    # Hard block on defense/aerospace contractors and known subsidiaries,
+    # checked on the company field directly — the existing
+    # HARD_DISQUALIFIER_PATTERNS "defense/aerospace" category only catches
+    # JD-text jargon ("DoD," "classified"), which misses postings that
+    # don't happen to use those words even though the employer itself is
+    # unambiguous.
+    defense_match = _DEFENSE_CONTRACTOR_RE.search(company)
+    if defense_match:
+        return False, f"defense contractor: '{defense_match.group(0)}'"
+
     # Hard block on title — these are almost never a fit
     for term in TITLE_BLOCKLIST:
         if term in title:
             return False, f"title blocklist: '{term}'"
+
+    # Hard block on occupation mismatch — blue-collar/manual-labor/field
+    # titles outside Jeff's lanes, regardless of how mission-aligned the
+    # employer is (a Forklift Operator posting at a food-security
+    # nonprofit is still a forklift operator role)
+    occupation_match = _BLOCKED_TITLE_RE.search(title) or _DISTRIBUTION_RE.search(title)
+    if occupation_match:
+        return False, f"occupation mismatch: '{occupation_match.group(0)}'"
+    for base_pattern, protective_pattern in _PROTECTED_OCCUPATION_TERMS:
+        base_match = re.search(base_pattern, title)
+        if base_match and not re.search(protective_pattern, title):
+            return False, f"occupation mismatch: '{base_match.group(0)}'"
 
     # Strong signal in title — send to Claude
     for term in TITLE_ALLOWLIST:
