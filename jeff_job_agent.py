@@ -86,6 +86,14 @@ CONFIG = {
     # Score threshold — only create Trello cards for roles at or above this
     "min_score_for_card": 60,
 
+    # Alert-email sources to scan for job listings. Idealist stays on;
+    # LinkedIn and Built In are switched off (2026-08) — their alerts
+    # weren't surfacing roles Jeff was interested in. The scan functions
+    # themselves (run_gmail_scan_linkedin, run_gmail_scan_builtin) are
+    # untouched — flip these back to True to turn a source back on.
+    "enable_linkedin_alerts": False,
+    "enable_builtin_alerts": False,
+
     # How many days back to scan Gmail for status updates
     "gmail_lookback_days": 7,
 
@@ -2032,15 +2040,21 @@ def run_gmail_scan():
         if idealist_cards:
             log.info(f"  {idealist_cards} new Idealist card(s) added to Watching")
 
-        linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
-        save_seen_jobs(seen)
-        if linkedin_cards:
-            log.info(f"  {linkedin_cards} new LinkedIn card(s) added to Watching")
+        if CONFIG["enable_linkedin_alerts"]:
+            linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
+            save_seen_jobs(seen)
+            if linkedin_cards:
+                log.info(f"  {linkedin_cards} new LinkedIn card(s) added to Watching")
+        else:
+            log.info("  LinkedIn alert scan disabled (CONFIG['enable_linkedin_alerts'] = False) — skipping")
 
-        builtin_cards = run_gmail_scan_builtin(service, seen, list_map, watching_list_id, existing_cards)
-        save_seen_jobs(seen)
-        if builtin_cards:
-            log.info(f"  {builtin_cards} new Built In card(s) added to Watching")
+        if CONFIG["enable_builtin_alerts"]:
+            builtin_cards = run_gmail_scan_builtin(service, seen, list_map, watching_list_id, existing_cards)
+            save_seen_jobs(seen)
+            if builtin_cards:
+                log.info(f"  {builtin_cards} new Built In card(s) added to Watching")
+        else:
+            log.info("  Built In alert scan disabled (CONFIG['enable_builtin_alerts'] = False) — skipping")
     else:
         log.warning("Could not find Watching list — skipping alert-email Gmail scans")
 
