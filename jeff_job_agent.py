@@ -42,7 +42,7 @@ from job_quality import (
     POLICY_VERSION, RETRY_STATES, atomic_json, canonical_url,
     contains_term, extract_posting, find_duplicate, known_company,
     posting_key, record_decision, should_process, sufficient_description,
-    validate_score, utcnow,
+    validate_score, utcnow, navigation_url, idealist_batches,
 )
 
 # ─────────────────────────────────────────────
@@ -209,9 +209,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-RUN_REPORT = {"started": utcnow().isoformat(), "sources": {}, "counts": {}, "jobs": [], "warnings": []}
+RUN_REPORT = {"started": utcnow().isoformat(), "sources": {}, "counts": {}, "jobs": [], "warnings": [], "errors": []}
 _PROCESSED_THIS_RUN = set()
 _ALERT_CACHE = None
+_COLLECT_JOBS = False
+_JOB_QUEUE = {}
+_DEFERRED_EXTRACTIONS = {}
+_EXTRACTION_ATTEMPTS = set()
 
 
 def budgeted_message(client, **kwargs):
@@ -253,23 +257,100 @@ def report_outcome(job, outcome, reason=""):
     return outcome
 
 
+def run_status(report):
+    health = [source["healthy"] for source in report["sources"].values() if "healthy" in source]
+    if report.get("errors") or (health and not any(health)):
+        return "failed"
+    incomplete = {"score_failed", "delivery_failed", "description_unavailable", "budget_deferred"}
+    if report["warnings"] or report.get("budget_deferred") or any(
+            report["counts"].get(key) for key in incomplete) or report.get("pending_digest_extractions"):
+        return "partial"
+    return "complete"
+
+
+def candidate_priority(job, seen):
+    previous = seen.get(posting_key(job), {})
+    # A budget deferral has never received a score, so it still gets a first look.
+    history = (previous.get("status") in RETRY_STATES - {"budget_deferred", "delivery_failed"}
+               and not navigation_url(job.get("url")))
+    plausible = any(contains_term(job.get("title", ""), term) for term in TITLE_ALLOWLIST)
+    return (history, not plausible, previous.get("retry_after", ""))
+
+
+def flush_job_queue(fresh_only=False):
+    global _COLLECT_JOBS
+    if not _JOB_QUEUE:
+        return
+    seen = load_seen_jobs()
+    candidates = []
+    historical = 0
+    for job in sorted(_JOB_QUEUE.values(), key=lambda j: candidate_priority(j, seen)):
+        key = posting_key(job)
+        if not should_process(seen, job) or key in _PROCESSED_THIS_RUN:
+            _JOB_QUEUE.pop(key, None)
+            continue
+        if candidate_priority(job, seen)[0]:
+            if fresh_only:
+                continue
+            if historical >= CONFIG["max_retry_jobs_per_run"]:
+                continue  # already durable in seen_jobs; retry date remains due
+            historical += 1
+        candidates.append(job)
+    if not candidates:
+        return  # cached batches do not require another Trello board read
+    list_map = get_trello_lists()
+    watching = list_map.get(CONFIG["trello_lists"]["watching"])
+    if not watching:
+        raise RuntimeError("Watching list is missing")
+    cards = get_cards_for_duplicate_check(list_map)
+    collecting = _COLLECT_JOBS
+    _COLLECT_JOBS = False
+    try:
+        for job in candidates:
+            process_job(job, seen, cards, watching)
+            _JOB_QUEUE.pop(posting_key(job), None)
+    finally:
+        _COLLECT_JOBS = collecting
+
+
+def collect_idealist_batch(listings):
+    for listing in listings:
+        candidate = idealist_job(listing)
+        if candidate["title"]:
+            _JOB_QUEUE.setdefault(posting_key(candidate), candidate)
+    # Give these jobs a scoring opportunity before spending on another batch.
+    flush_job_queue(fresh_only=True)
+
+
+def idealist_job(listing):
+    title = (listing.get("title") or "").strip()
+    company = (listing.get("company") or "See posting").strip()
+    return {"company": company, "title": title, "url": (listing.get("url") or "").strip(),
+            "location": "Not specified", "salary": "Not listed",
+            "description": f"{title} at {company}. Source: Idealist job alert.",
+            "source": "Idealist (Gmail alert)"}
+
+
 def write_run_report():
     RUN_REPORT["finished"] = utcnow().isoformat()
     RUN_REPORT["api_usage"] = DailyBudget(CONFIG["api_usage_file"], CONFIG["daily_api_budget_usd"]).load()
     RUN_REPORT["pending_digest_extractions"] = sum(v.get("status") == "pending" for v in alert_cache().values())
     atomic_json(CONFIG["api_usage_file"], RUN_REPORT["api_usage"])
     atomic_json(CONFIG["alert_extractions_file"], alert_cache())
+    RUN_REPORT["status"] = run_status(RUN_REPORT)
     atomic_json(CONFIG["run_report_file"], RUN_REPORT)
     seen = load_seen_jobs()
     pending = [v for v in seen.values() if v.get("status") in RETRY_STATES]
     atomic_json(CONFIG["review_jobs_file"], pending)
-    summary = ["## Job search results", "", "| Outcome | Count |", "| --- | ---: |"]
+    summary = [f"## Job search results: {RUN_REPORT['status']}", "", "| Outcome | Count |", "| --- | ---: |"]
     summary += [f"| {key} | {count} |" for key, count in RUN_REPORT["counts"].items()]
     summary += ["", f"API usage today: ${RUN_REPORT['api_usage']['usd']:.4f} / ${CONFIG['daily_api_budget_usd']:.2f} cap."]
     summary += ["", f"Pending retry or review: {len(pending)}. See the private run-report artifact."]
     summary += ["", "### Sources"]
     summary += [f"- {name}: {data}" for name, data in RUN_REPORT["sources"].items()]
     summary += ["", "### Warnings"] + [f"- {warning}" for warning in RUN_REPORT["warnings"]]
+    summary += ["", "### Errors"] + [f"- {error}" for error in RUN_REPORT.get("errors", [])]
+    log.info("Run status: %s", RUN_REPORT["status"])
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
             output.write("\n".join(summary) + "\n")
@@ -278,6 +359,9 @@ def write_run_report():
 def process_job(job, seen, existing_cards, watching_list_id):
     """One delivery/retry contract shared by crawlers and every email source."""
     key = posting_key(job)
+    if _COLLECT_JOBS:
+        _JOB_QUEUE.setdefault(key, dict(job))
+        return "queued"
     if key in _PROCESSED_THIS_RUN:
         return "cached"
     _PROCESSED_THIS_RUN.add(key)
@@ -289,6 +373,8 @@ def process_job(job, seen, existing_cards, watching_list_id):
         save_seen_jobs(seen)
         return report_outcome(job, status, reason)
 
+    if navigation_url(job.get("url")):
+        return finish("not_a_job", "Board navigation link; removed from retry queue")
     match = find_duplicate(job, existing_cards, clean_company_name)
     if match:
         return finish("duplicate", "Previously passed on" if match.get("closed") else
@@ -1173,7 +1259,7 @@ def crawl_remote_impact():
                 if not href.startswith("http"):
                     href = "https://remoteimpact.org" + href
 
-                if href in seen_urls or not title:
+                if navigation_url(href) or href in seen_urls or not title:
                     continue
                 seen_urls.add(href)
 
@@ -1269,7 +1355,7 @@ def crawl_tech_jobs_for_good():
                     continue
                 if not href.startswith("http"):
                     href = base_url + href
-                if href in seen_urls:
+                if navigation_url(href) or href in seen_urls:
                     continue
                 seen_urls.add(href)
 
@@ -1501,7 +1587,7 @@ def crawl_ffwd():
                     continue
                 if not href.startswith("http"):
                     href = base_url + href
-                if href in seen_urls:
+                if navigation_url(href) or href in seen_urls:
                     continue
                 seen_urls.add(href)
 
@@ -1612,8 +1698,10 @@ def search_gmail(service, query, max_results=50):
                 "snippet": detail.get("snippet", ""),
             })
 
+        RUN_REPORT["sources"]["Gmail"] = {"healthy": True}
         return snippets
     except Exception as e:
+        RUN_REPORT["sources"].setdefault("Gmail", {"healthy": False})
         RUN_REPORT["warnings"].append(f"Gmail search failed: {type(e).__name__}")
         log.error("Gmail search failed: %s", type(e).__name__)
         return []
@@ -2046,13 +2134,15 @@ def run_gmail_scan():
         existing_cards = get_cards_for_duplicate_check(list_map)
 
         idealist_cards = run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_cards)
-        save_seen_jobs(seen)
+        if not _COLLECT_JOBS:
+            save_seen_jobs(seen)
         if idealist_cards:
             log.info(f"  {idealist_cards} new Idealist card(s) added to Watching")
 
         if CONFIG["enable_linkedin_alerts"]:
             linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
-            save_seen_jobs(seen)
+            if not _COLLECT_JOBS:
+                save_seen_jobs(seen)
             if linkedin_cards:
                 log.info(f"  {linkedin_cards} new LinkedIn card(s) added to Watching")
         else:
@@ -2060,13 +2150,14 @@ def run_gmail_scan():
 
         if CONFIG["enable_builtin_alerts"]:
             builtin_cards = run_gmail_scan_builtin(service, seen, list_map, watching_list_id, existing_cards)
-            save_seen_jobs(seen)
+            if not _COLLECT_JOBS:
+                save_seen_jobs(seen)
             if builtin_cards:
                 log.info(f"  {builtin_cards} new Built In card(s) added to Watching")
         else:
             log.info("  Built In alert scan disabled (CONFIG['enable_builtin_alerts'] = False) — skipping")
     else:
-        log.warning("Could not find Watching list — skipping alert-email Gmail scans")
+        raise RuntimeError("Watching list is missing")
 
     # ── Gmail-Trello reconciliation ──
     # Catches threads the per-company scan above misses entirely (it only
@@ -2261,90 +2352,76 @@ def validate_extraction_completeness(listings, stated_count, search_name):
         return False
     return True
 
-def extract_idealist_section_listings(client, subject, section):
-    """
-    Extracts listings from one Idealist digest section. Tells Claude the
-    expected count upfront (stronger than only checking after the fact).
-    Retries ONCE with an explicit "you missed some" instruction if the
-    count doesn't match; if still short after the retry, logs and
-    proceeds with whatever was extracted — no unbounded retry loop.
-    """
-    search_name = section["search_name"]
-    raw_text = section["raw_text"]
-    stated_count = section["stated_count"]
-
-    if stated_count == 0:
+def extract_idealist_section_listings(client, subject, section, on_batch=None):
+    """Cache each small extraction independently; never repeat a full paid section."""
+    search_name, raw_text, count = section["search_name"], section["raw_text"], section["stated_count"]
+    if count == 0:
         return []
-    extraction_key = hashlib.sha256((search_name + raw_text).encode()).hexdigest()
-    cached = alert_cache().get(extraction_key)
-    if cached and len(cached.get("listings", [])) == stated_count:
-        return cached["listings"]  # nothing to extract, skip the call entirely
-    queue_extraction(extraction_key, section=section, subject=subject)
-
-    prompt = f"""Extract job listings from this section of an Idealist job alert digest email.
-
-Digest subject: {subject}
-Saved search name: "{search_name}"
-This section contains exactly {stated_count} job listing(s). Extract ALL {stated_count} of them — do not stop early or summarize.
-
-Section content:
-{raw_text}
-
-Return ONLY a JSON array of job objects, with exactly {stated_count} entries.
-Each object should have:
-{{"title": "job title", "company": "organization name", "url": "job URL if visible or empty string"}}
-
-Return only the JSON array, no other text."""
-
-    try:
-        message = budgeted_message(client,
-            model="claude-sonnet-4-6",
-            max_tokens=min(6000, max(600, stated_count * 160)),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        listings = safe_parse_json_list(message.content[0].text.strip())
-    except BudgetExceeded:
+    key = hashlib.sha256((search_name + raw_text).encode()).hexdigest()
+    cached = alert_cache().get(key, {})
+    if len(cached.get("listings", [])) == count:
+        if on_batch:
+            on_batch(cached["listings"])
+        return cached["listings"]
+    if _COLLECT_JOBS and cached.get("status") == "pending":
+        _DEFERRED_EXTRACTIONS[key] = (client, subject, section)
         return []
-    except Exception as e:
-        log.warning(f"  Could not parse Idealist section '{search_name}': {e}")
-        RUN_REPORT["warnings"].append(f"Idealist {search_name}: extraction failed")
-        return []
-
-    if validate_extraction_completeness(listings, stated_count, search_name):
-        store_extraction(extraction_key, listings)
-        return listings
-
-    retry_prompt = f"""Your previous extraction of the "{search_name}" section returned {len(listings)} listing(s), but this section contains exactly {stated_count} listings — you missed some.
-
-Section content:
-{raw_text}
-
-Extract EVERY SINGLE job listing in this section. There should be exactly {stated_count} objects in your output. Double-check you have not skipped or merged any listings.
-
-Return ONLY a JSON array of job objects:
-{{"title": "job title", "company": "organization name", "url": "job URL if visible or empty string"}}
-
-Return only the JSON array, no other text."""
-
-    try:
-        retry_message = budgeted_message(client,
-            model="claude-sonnet-4-6",
-            max_tokens=min(6000, max(600, stated_count * 160)),
-            messages=[{"role": "user", "content": retry_prompt}],
-        )
-        retry_listings = safe_parse_json_list(retry_message.content[0].text.strip())
-    except BudgetExceeded:
-        return listings
-    except Exception as e:
-        RUN_REPORT["warnings"].append(f"Idealist {search_name}: extraction retry failed")
-        log.warning(f"  Retry failed for Idealist section '{search_name}': {e}")
-        return listings  # keep the original partial result
-
-    if not validate_extraction_completeness(retry_listings, stated_count, search_name):
-        RUN_REPORT["warnings"].append(f"Idealist {search_name}: incomplete extraction")
+    queue_extraction(key, section=section, subject=subject)
+    batches = idealist_batches(raw_text)
+    if not batches and count <= 5 and len(raw_text) <= 6000:
+        batches = [{"raw_text": raw_text, "urls": [], "count": count}]
+    listings = []
+    for batch in batches:
+        expected = len(batch["urls"]) or batch["count"]
+        batch_key = "batch:" + hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+        saved = alert_cache().get(batch_key, {})
+        if "listings" in saved:
+            listings.extend(saved["listings"])
+            if on_batch:
+                on_batch(saved["listings"])
+            continue
+        if batch_key in _EXTRACTION_ATTEMPTS:
+            continue
+        _EXTRACTION_ATTEMPTS.add(batch_key)
+        prompt = f"""Extract exactly {expected} jobs from this Idealist digest batch.
+Subject: {subject}
+Saved search: {search_name}
+Target URLs: {json.dumps(batch['urls'])}
+Extract ONLY the target URLs when listed. Nearby text may include the previous
+organization or the next title as context; do not include neighboring jobs.
+Copy each target URL exactly. Do not invent employers; use 'See posting' if unclear.
+Content:
+{batch['raw_text']}
+Return ONLY a JSON array of objects with string title, company, url fields."""
+        try:
+            message = budgeted_message(client, model="claude-sonnet-4-6",
+                max_tokens=max(600, expected * 240), messages=[{"role": "user", "content": prompt}])
+            extracted = safe_parse_json_list(message.content[0].text.strip())
+            valid = (getattr(message, "stop_reason", None) != "max_tokens" and len(extracted) == expected
+                and all(isinstance(item, dict) and isinstance(item.get("title"), str) and item["title"].strip()
+                        and isinstance(item.get("url"), str) and isinstance(item.get("company"), str)
+                        for item in extracted))
+            if valid and batch["urls"]:
+                valid = {canonical_url(item["url"]) for item in extracted} == {canonical_url(url) for url in batch["urls"]}
+            if not valid:
+                raise ValueError("Incomplete or invalid extraction batch")
+        except BudgetExceeded:
+            break
+        except Exception as exc:
+            RUN_REPORT["warnings"].append(f"Idealist {search_name}: batch extraction failed ({type(exc).__name__})")
+            log.warning("Idealist batch failed; completed batches retained: %s", type(exc).__name__)
+            continue
+        store_extraction(batch_key, extracted)
+        listings.extend(extracted)
+        if on_batch:
+            on_batch(extracted)
+    unique = {posting_key(item): item for item in listings}
+    listings = list(unique.values())
+    if validate_extraction_completeness(listings, count, search_name):
+        store_extraction(key, listings)
     else:
-        store_extraction(extraction_key, retry_listings)
-    return retry_listings if len(retry_listings) >= len(listings) else listings
+        RUN_REPORT["warnings"].append(f"Idealist {search_name}: incomplete extraction; queued")
+    return listings
 
 
 def run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_cards):
@@ -2373,8 +2450,8 @@ def run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_
 
     pending = [dict(id="pending:" + key, subject=value.get("subject", ""), snippet="",
                     saved_section=value.get("section"), saved_body=value.get("body"))
-               for key, value in alert_cache().items() if value.get("status") == "pending"]
-    emails = pending + emails
+               for key, value in alert_cache().items() if value.get("status") == "pending" and (value.get("section") or value.get("body"))]
+    emails = emails + pending
 
     if not emails:
         log.info("  No Idealist alert emails found in Gmail.")
@@ -2398,15 +2475,20 @@ def run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_
 
         sections = [email["saved_section"]] if email.get("saved_section") else split_into_search_sections(content_for_claude)
 
+        if not sections:
+            linked_count = sum(len(batch["urls"]) for batch in idealist_batches(content_for_claude))
+            if linked_count:
+                sections = [{"search_name": email['subject'], "raw_text": content_for_claude,
+                             "stated_count": linked_count}]
         listings = []
         if sections:
             log.info(f"  Digest split into {len(sections)} saved-search section(s)")
             for section in sections:
-                listings.extend(extract_idealist_section_listings(client, email['subject'], section))
+                listings.extend(extract_idealist_section_listings(client, email['subject'], section,
+                    on_batch=collect_idealist_batch if _COLLECT_JOBS else None))
         else:
-            # Fallback: unrecognized digest format — whole-body extraction,
-            # with a raised max_tokens as cheap insurance even though this
-            # is no longer the primary path
+            # Small unrecognized emails retain the legacy cache key. Large inputs
+            # stay queued for inspection instead of another timeout-prone call.
             log.info("  Digest did not match expected section format — using whole-body fallback extraction")
             prompt = f"""Extract job listings from this Idealist job alert email.
 
@@ -2428,8 +2510,14 @@ Return only the JSON array, no other text."""
                     listings = cached["listings"]
                 else:
                     queue_extraction(extraction_key, body=content_for_claude, subject=email['subject'])
+                    if extraction_key in _EXTRACTION_ATTEMPTS:
+                        continue
+                    _EXTRACTION_ATTEMPTS.add(extraction_key)
+                    if len(content_for_claude) > 6000:
+                        RUN_REPORT["warnings"].append("Idealist unrecognized large email: queued for format review")
+                        continue
                     message = budgeted_message(client,
-                        model="claude-sonnet-4-6", max_tokens=2000,
+                        model="claude-sonnet-4-6", max_tokens=1200,
                         messages=[{"role": "user", "content": prompt}])
                     listings = safe_parse_json_list(message.content[0].text.strip())
                     if message.stop_reason != "max_tokens" and (listings or message.content[0].text.strip() == "[]"):
@@ -2447,25 +2535,10 @@ Return only the JSON array, no other text."""
         log.info(f"  Extracted {len(listings)} listing(s) from alert email")
 
         for listing in listings:
-            title = (listing.get("title") or "").strip()
-            company = (listing.get("company") or "See posting").strip()
-            url = (listing.get("url") or "").strip()
-
-            if not title:
-                continue
-
-            job = {
-                "company":     company,
-                "title":       title,
-                "url":         url or "https://www.idealist.org/en/jobs",
-                "location":    "Not specified",
-                "salary":      "Not listed",
-                "description": f"{title} at {company}. Source: Idealist job alert.",
-                "source":      "Idealist (Gmail alert)",
-            }
-
-            outcome = process_job(job, seen, existing_cards, watching_list_id)
-            cards_created += outcome == "created"
+            job = idealist_job(listing)
+            if job["title"]:
+                outcome = process_job(job, seen, existing_cards, watching_list_id)
+                cards_created += outcome == "created"
 
     log.info(f"  Idealist Gmail scan complete. {cards_created} card(s) created.")
     return cards_created
@@ -2697,8 +2770,6 @@ def run_job_crawl():
                   if v.get("status") in RETRY_STATES and v.get("job")
                   and should_process(seen, v["job"])]
     retry_jobs.sort(key=lambda j: seen[posting_key(j)].get("retry_after", ""))
-    for job in retry_jobs[:CONFIG["max_retry_jobs_per_run"]]:
-        process_job(dict(job), seen, existing_cards, watching_list_id)
     for crawler in (crawl_remote_impact, crawl_tech_jobs_for_good, crawl_ffwd):
         name = crawler.__name__
         try:
@@ -2706,11 +2777,14 @@ def run_job_crawl():
             RUN_REPORT["sources"][name] = {"collected": len(jobs), "healthy": bool(jobs)}
             if not jobs:
                 RUN_REPORT["warnings"].append(f"{name}: zero postings; source health needs checking")
-            for job in jobs:
+            for job in sorted(jobs, key=lambda j: candidate_priority(j, seen)):
                 process_job(job, seen, existing_cards, watching_list_id)
         except Exception as exc:
+            RUN_REPORT["sources"][name] = {"healthy": False}
             RUN_REPORT["warnings"].append(f"{name}: {type(exc).__name__}")
             log.exception("Source failed: %s", name)
+    for job in retry_jobs:
+        process_job(dict(job), seen, existing_cards, watching_list_id)
     save_seen_jobs(seen)
 
 
@@ -2719,6 +2793,7 @@ def run_job_crawl():
 # ─────────────────────────────────────────────
 
 def main():
+    global _COLLECT_JOBS
     parser = argparse.ArgumentParser(description="Jeff's Job Search Agent")
     parser.add_argument("--crawl",       action="store_true", help="Run job crawl only")
     parser.add_argument("--gmail",       action="store_true", help="Run Gmail scan only")
@@ -2729,10 +2804,12 @@ def main():
     if args.gmail_setup:
         log.info("Running Gmail OAuth setup...")
         service = get_gmail_service()
-        if service:
-            log.info("✓ Gmail connected successfully. Token saved.")
+        if not service:
+            raise RuntimeError("Could not connect to Gmail")
+        log.info("✓ Gmail connected successfully. Token saved.")
         return
 
+    _COLLECT_JOBS = True
     if args.crawl:
         run_job_crawl()
     elif args.gmail:
@@ -2740,25 +2817,35 @@ def main():
     elif args.reconcile:
         service = get_gmail_service()
         if not service:
-            log.error("Could not connect to Gmail. Run --gmail-setup first.")
-            return
+            raise RuntimeError("Could not connect to Gmail. Run --gmail-setup first.")
         list_map = get_trello_lists()
         run_gmail_trello_reconciliation(service, list_map)
     else:
         for phase in (run_job_crawl, run_gmail_scan):
             try:
                 phase()
+                flush_job_queue(fresh_only=True)
             except Exception as exc:
-                RUN_REPORT["warnings"].append(f"{phase.__name__}: {type(exc).__name__}")
+                RUN_REPORT["errors"].append(f"{phase.__name__}: {type(exc).__name__}")
                 log.error("Phase failed: %s (%s)", phase.__name__, type(exc).__name__)
+
+    _COLLECT_JOBS = False
+    # Fresh candidates get the first scoring opportunities; historical rechecks go last.
+    flush_job_queue(fresh_only=True)
+    for client, subject, section in _DEFERRED_EXTRACTIONS.values():
+        extract_idealist_section_listings(client, subject, section, on_batch=collect_idealist_batch)
+    flush_job_queue()
 
 
 if __name__ == "__main__":
     try:
         main()
+    except Exception as exc:
+        RUN_REPORT["errors"].append(f"Fatal: {type(exc).__name__}")
+        log.exception("Run failed")
     finally:
         write_run_report()
-    if RUN_REPORT["warnings"]:
+    if RUN_REPORT["status"] == "failed":
         raise SystemExit(1)
 
 

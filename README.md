@@ -150,9 +150,12 @@ Before each paid request, the agent uses the unbilled token-count endpoint and r
 - Stable profile/portfolio input uses prompt caching.
 - Delivery retries reuse the saved score.
 - Unchanged ambiguous evidence reuses the prior assessment instead of paying again.
-- Jobs beyond the daily cap remain queued.
+- Jobs beyond the daily cap remain queued. New plausible roles and jobs awaiting their first score take priority over historical rechecks.
+- Idealist sections are split into batches of at most five linked jobs. Each completed batch is saved immediately; jobs get a scoring opportunity before the next extraction. A timeout retries only unfinished batches on a later run.
+- Board navigation links are removed before collection counts and old navigation retries are retired without scoring.
+- Missing optional score metadata (such as a salary suggestion) gets a safe default. Eligibility evidence and the numeric score remain required.
 
-The private Actions summary reports measured usage, outcomes, and source health. Its artifact includes `run_report.json` and `review_jobs.json`. A day with no suitable matches is distinct from failed collection or a reached budget cap. Older README per-job cost estimates were not measured and should not be used.
+The private Actions summary reports reserved/reconciled API usage, outcomes, and source health. Runs explicitly report `complete`, `partial`, or `failed`. Isolated source or extraction problems and budget deferrals are partial results; fatal phase errors and total source outages still fail the workflow. Its artifact includes `run_report.json` and `review_jobs.json`. A day with no suitable matches is distinct from failed collection or a reached budget cap. Older README per-job cost estimates were not measured and should not be used.
 
 
 ---
@@ -168,7 +171,7 @@ Key settings at the top of `jeff_job_agent.py`:
 | `seen_jobs_file` | `seen_jobs.json` | Local cache of processed jobs |
 | `log_file` | `job_agent.log` | Full run log |
 | `daily_api_budget_usd` | 0.50 | Agent-wide daily API spending cap |
-| `max_retry_jobs_per_run` | 8 | Independent retries before fresh crawling |
+| `max_retry_jobs_per_run` | 8 | Historical rechecks after fresh candidates |
 | `max_description_chars` | 30000 | Oversized descriptions go to review; no silent cut-off |
 
 ---

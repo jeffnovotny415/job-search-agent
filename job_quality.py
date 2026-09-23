@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -43,6 +43,39 @@ def canonical_url(url):
                            urlencode(sorted(query)), ""))
     except ValueError:
         return ""
+
+
+def navigation_url(url):
+    """Only known board navigation routes; never guess from a role title."""
+    parts = urlsplit(url or "")
+    if parts.hostname not in {"remoteimpact.org", "www.remoteimpact.org",
+                              "techjobsforgood.com", "www.techjobsforgood.com", "jobs.ffwd.org"}:
+        return False
+    path = parts.path.rstrip("/").lower()
+    return path in {"", "/jobs", "/jobs/new", "/jobs/post"} or any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in ("/jobs/category", "/jobs/categories", "/jobs/companies"))
+
+
+def idealist_batches(raw_text, batch_size=5):
+    """Group target URLs with adjacent title/employer context, even in flat email text.
+
+    Overlap is intentional: old saved emails have no card boundaries. Explicit
+    target URLs keep the neighboring listing context out of the output.
+    """
+    def decode_url(match):
+        decoded = unquote(match[0])
+        target = re.search(r"(?:www\.)?idealist\.org/en/(?:nonprofit-job|consultant-job|business-job|government-job|job)/[a-f0-9]{32}[^\s?]*", decoded)
+        return "https://www." + target[0].removeprefix("www.") if target else match[0]
+    text = re.sub(r"https?://\S+", decode_url, raw_text)
+    links = list(re.finditer(r"https://www\.idealist\.org/en/(?:nonprofit-job|consultant-job|business-job|government-job|job)/[a-f0-9]{32}[^\s]*", text))
+    batches = []
+    for start in range(0, len(links), batch_size):
+        end = min(start + batch_size, len(links))
+        left = links[start - 1].end() if start else 0
+        right = links[end].start() if end < len(links) else len(text)
+        batches.append({"raw_text": text[left:right], "urls": [m[0] for m in links[start:end]]})
+    return batches
 
 
 def posting_key(job):
@@ -251,9 +284,16 @@ def validate_score(result, job):
         raise ValueError("Score must be a number between 0 and 100")
     if type(result.get("disqualified")) is not bool:
         raise ValueError("disqualified must be boolean")
-    for field in ("why_it_fits", "concerns", "lane", "mission_fit", "next_step", "salary_ask", "salary_source"):
+    for field in ("why_it_fits", "concerns"):
         if not isinstance(result.get(field), str):
             raise ValueError(f"Missing text field: {field}")
+    for field, default in {"lane": "Not provided", "mission_fit": "Not provided",
+                           "next_step": "Review posting", "salary_ask": "Not provided",
+                           "salary_source": "estimated"}.items():
+        if not isinstance(result.get(field), str) or not result[field].strip():
+            result[field] = default
+    if result.get("environment_flags") is None:
+        result["environment_flags"] = []
     flags = result.get("environment_flags")
     if not isinstance(flags, list) or not all(isinstance(x, str) for x in flags):
         raise ValueError("environment_flags must be a list of strings")
