@@ -12,6 +12,11 @@ seen_emails.json
 seen_reconciliation_emails.json
 orphan_candidates.json
 job_agent.log
+api_usage.json
+alert_extractions.json
+run_report.json
+review_jobs.json
+*.json.tmp
 
 # Python
 __pycache__/
