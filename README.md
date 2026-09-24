@@ -18,7 +18,10 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 - Skip annual salary ranges whose maximum is below **$90,000**, except explicitly part-time roles.
 - Contract/hourly listings must reach **$65/hour**; explicitly part-time employee roles retain the salary exception.
 - Missing salary, unclear remote eligibility, geographic restrictions, or ambiguous pay units are flagged for the Claude project instead of silently discarded.
-- Known employers do not require a full-description fetch. Missing names get a free structured-metadata lookup; if the name cannot be recovered, no unnamed card is created.
+- Promising listings with missing employer, location, pay, or verified description get one free HTTP posting fetch. JSON-LD employer data overrides provisional board labels. Successful metadata is cached for seven days; blocked/empty reads for one day. Missing employers never produce unnamed cards.
+- Factual posting text is checked for explicit office requirements, excessive/regular required travel, California-only residency, local-candidate restrictions tied to known incompatible locations, and ownership of customer accounts/renewals. This is a narrow rules check, not a model evaluation of fit. Technical mentions such as hybrid cloud and adjacent customer-success teams do not reject a role.
+- Idealist consultant links use the contract floor, including previously cached alerts. String-valued structured salaries are parsed, and location/pay appear as readable text on cards.
+- Repeated US location suffixes are ignored in company/title duplicate checks; seniority and specialty distinctions remain. Multiple new cards at one employer receive a comparison flag at the end of the run.
 
 **Trello handoff**
 Cards in Watching say **First-pass lead — awaiting Claude deep vet**. They include employer, source link, listed location/pay, and specific facts to verify. They do not claim to be fully vetted, assign a suitability score, or invent salary recommendations or remote eligibility.
@@ -197,6 +200,6 @@ The automation discovers leads; my separate Claude project evaluates them deeply
 ## Notes
 
 - LinkedIn and Built In are sourced via Gmail alert email parsing rather than direct scraping — both platforms block automated crawlers
-- Idealist and Wellfound discovery uses email metadata; full descriptions are checked in the separate Claude project.
+- Idealist and Wellfound discovery uses email metadata plus cached free posting reads where accessible. Deep evaluation of full descriptions remains in the separate Claude project. Missing remote labels or a city alone remain uncertain rather than proof of on-site work.
 - Do not clear the cache to deploy fixes: it preserves prior decisions and retry state. Run `python3 -m unittest discover -s tests -v` to verify the regression suite without spending API credits or touching Trello.
 - Adapt the first-pass CONFIG thresholds and title filters for another search; the detailed Claude-project instructions are managed separately.

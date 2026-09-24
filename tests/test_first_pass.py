@@ -120,10 +120,10 @@ class FirstPassPipelineTests(unittest.TestCase):
             self.assertEqual(agent.process_job(job(company='Unknown'),self.seen,cards,'w'),'duplicate')
             create.assert_not_called()
 
-    def test_no_full_description_fetch_or_scoring_for_known_employer(self):
-        with patch.object(agent,'safe_get') as get,patch.object(agent,'create_trello_card',return_value={'id':'card'}),patch.object(agent,'budgeted_message') as api:
+    def test_known_employer_missing_description_gets_free_fetch_only(self):
+        with patch.object(agent,'safe_get',return_value=None) as get,patch.object(agent,'create_trello_card',return_value={'id':'card'}),patch.object(agent,'budgeted_message') as api:
             self.assertEqual(agent.process_job(job(description='',description_verified=False),self.seen,[],'w'),'created')
-            get.assert_not_called();api.assert_not_called()
+            get.assert_called_once();api.assert_not_called()
 
     def test_underpaid_and_nonremote_roles_never_create_cards(self):
         for candidate in [job(salary='$80k'),job(location='Hybrid'),job(employment_type='Contract',salary='$60/hr')]:

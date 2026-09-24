@@ -39,7 +39,8 @@ from googleapiclient.discovery import build
 import base64
 from api_budget import DailyBudget, BudgetExceeded
 from first_pass import (screen_metadata, email_html, parse_idealist_html, parse_wellfound_html,
-                        extract_listing_metadata, idealist_url)
+                        extract_listing_metadata, idealist_url, structured_value,
+                        display_location, display_pay, explicit_description_exclusions)
 from job_quality import (
     POLICY_VERSION, RETRY_STATES, atomic_json, canonical_url,
     contains_term, extract_posting, find_duplicate, known_company,
@@ -384,7 +385,8 @@ def process_job(job, seen, existing_cards, watching_list_id):
     if navigation_url(job.get("url")):
         return finish("not_a_job", "Board navigation link; removed from retry queue")
     match = find_duplicate(job, existing_cards, clean_company_name)
-    if match:
+    if match and (job.get("source") != "FFWD Jobs" or
+                  canonical_url(job.get("url")) == canonical_url(match.get("url"))):
         return finish("duplicate", "Previously passed on" if match.get("closed") else
                       f"Already in {match['list_name']}", card_id=match["card_id"])
     should_score, reason = pre_filter({**job, "description": ""})
@@ -395,22 +397,25 @@ def process_job(job, seen, existing_cards, watching_list_id):
     result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
     if result["decision"] == "skip":
         return finish("filtered", result["reason"], result)
+    recover_first_pass_metadata(job)
     if not known_company(job.get("company")):
-        # A missing employer is the only reason this stage needs a posting fetch.
-        # Structured metadata is free; inaccessible pages never trigger paid retries.
-        response = safe_get(job.get("url", ""), timeout=15) if canonical_url(job.get("url")) else None
-        if response is not None:
-            job.update(extract_listing_metadata(response.text, job.get("title", "")))
-        if not known_company(job.get("company")):
-            return finish("needs_review", "Employer name unavailable; no unnamed Trello card created")
-        if not pre_filter({**job, "description": ""})[0] or not title_is_plausible(job):
-            return finish("filtered", "Recovered listing metadata does not match first-pass title/employer filters")
-        result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
-        if result["decision"] == "skip":
-            return finish("filtered", result["reason"], result)
-        match = find_duplicate(job, existing_cards, clean_company_name)
-        if match:
-            return finish("duplicate", "Existing card found after employer recovery", card_id=match["card_id"])
+        return finish("needs_review", "Employer name unavailable; no unnamed Trello card created")
+    if not pre_filter({**job, "description": ""})[0] or not title_is_plausible(job):
+        return finish("filtered", "Recovered listing metadata does not match first-pass title/employer filters")
+    result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
+    if result["decision"] == "skip":
+        return finish("filtered", result["reason"], result)
+    if job.get("description_verified"):
+        exclusions = explicit_description_exclusions(job.get("description", ""), job.get("location", ""))
+        if exclusions:
+            return finish("filtered", "; ".join(exclusions), result)
+        if re.search(r"\blocal candidates only\b", job.get("description", ""), re.I):
+            result["flags"].append("Verify local-applicant restriction against your home location")
+    if job.get("company_source") == "URL slug (provisional)":
+        result["flags"].append("Employer inferred from the board URL; verify the actual hiring organization")
+    match = find_duplicate(job, existing_cards, clean_company_name)
+    if match:
+        return finish("duplicate", "Existing card found after metadata recovery", card_id=match["card_id"])
     if job.get("link_needs_verification"):
         result["flags"].append("Alert link did not expose a direct job URL; locate the role by employer and title")
     record_decision(seen, job, "delivery_failed", "Delivery pending", result)
@@ -422,7 +427,63 @@ def process_job(job, seen, existing_cards, watching_list_id):
         return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
     existing_cards.append({"company": job["company"], "title": job["title"], "url": job.get("url"),
                            "card_id": card["id"], "list_name": "Watching", "closed": False})
+    RUN_REPORT.setdefault("created_cards", []).append({"company": job["company"], "card_id": card["id"]})
     return finish("created", "First-pass lead delivered for Claude deep vetting", result, card["id"])
+
+
+def recover_first_pass_metadata(job):
+    """One free posting request, with durable caching of successful and blocked reads."""
+    missing = {"", "unknown", "not listed", "not specified", "see posting"}
+    needs_fetch = (not known_company(job.get("company")) or
+                   str(job.get("location") or "").lower() in missing or
+                   str(job.get("salary") or "").lower() in missing or
+                   not job.get("description_verified") or not job.get("description"))
+    if not needs_fetch or not canonical_url(job.get("url")):
+        return
+    # Do not follow an unresolved email redirect into a generic jobs feed.
+    if "links.wellfound.com/" in job.get("url", ""):
+        return
+    key = "firstpass-metadata-v2:" + posting_key(job)
+    cached = alert_cache().get(key, {})
+    if cached.get("expires", "") > utcnow().isoformat():
+        metadata = cached.get("metadata", {})
+    else:
+        response = safe_get(job.get("url", ""), timeout=15)
+        metadata = extract_listing_metadata(response.text, job.get("title", ""), job.get("url", "")) if response is not None else {}
+        alert_cache()[key] = {"metadata": metadata, "expires": (utcnow() + timedelta(days=7 if metadata else 1)).isoformat()}
+        atomic_json(CONFIG["alert_extractions_file"], alert_cache())
+    metadata = dict(metadata)
+    # Preserve the email's explicit remote/hybrid information when JSON-LD only
+    # supplies a physical address. A conflicting requirement still fails below.
+    if metadata.get("location") and str(job.get("location") or "").lower() not in missing:
+        location = structured_value(metadata["location"])
+        if location and not structured_value(job.get("location")):
+            location["listingLocation"] = job["location"]
+            metadata["location"] = json.dumps(location, ensure_ascii=False)
+    job.update(metadata)
+    if known_company(metadata.get("company")):
+        job["company_source"] = "Listing structured data"
+    if "/consultant-job/" in job.get("url", ""):
+        job["employment_type"] = "contract"
+
+
+def flag_same_run_employers():
+    """Annotate only cards created by this run; never rewrite prior/user-edited cards."""
+    groups = {}
+    for card in RUN_REPORT.get("created_cards", []):
+        groups.setdefault(clean_company_name(card["company"]).lower(), []).append(card)
+    for cards in groups.values():
+        if len(cards) < 2:
+            continue
+        for card in cards:
+            note = f"\n\n**Same employer:** {len(cards)} cards created this run. Compare these roles before applying."
+            try:
+                # Re-read to preserve any edits made while the crawl was running.
+                current = get_card_description(card["card_id"])
+                if "**Same employer:**" not in current:
+                    update_card_description(card["card_id"], current + note)
+            except Exception as exc:
+                RUN_REPORT["warnings"].append(f"Same-employer annotation failed: {type(exc).__name__}")
 
 
 def title_is_plausible(job):
@@ -437,9 +498,9 @@ def build_first_pass_card_description(job, result):
 **URL:** {job.get('url', 'Not provided')}
 **Found:** {datetime.now().strftime('%Y-%m-%d')}
 
-**Listed location:** {job.get('location') or 'Not specified'}
+**Listed location:** {display_location(job.get('location'))}
 **Remote:** {result['checks'].get('remote', 'Needs verification')}
-**Listed pay:** {job.get('salary') or 'Not listed'}
+**Listed pay:** {display_pay(job.get('salary'))}
 **Employment type:** {job.get('employment_type') or 'Not specified'}
 **Metadata source:** {job.get('metadata_source', 'Job-board listing')}
 
@@ -465,6 +526,8 @@ TITLE_BLOCKLIST = [
     "sales", "account executive", "account manager", "business development",
     "revenue", "customer success", "client success", "gtm", "go-to-market", "commercial lending", "renewals", "marketing", "recruiter",
     "recruiting", "talent acquisition", "finance", "accounting", "payroll",
+    "customer operations", "customer experience", "development operations",
+    "creative lead", "clinic operations",
     "human resources", "hr manager", "hr director", "people operations",
     "legal counsel", "attorney", "lawyer", "nurse", "physician", "clinical",
     "ux designer", "graphic designer", "data scientist",
@@ -640,6 +703,14 @@ def pre_filter(job):
     title = job.get("title", "").lower()
     description = job.get("description", "").lower()
     company = job.get("company", "").lower()
+
+    # Fundraising work is excluded, but an IT/Salesforce role supporting that
+    # department remains eligible for the separate deep vet.
+    technical_title = any(contains_term(title, term) for term in
+                          ("it", "technology", "technical", "systems", "salesforce", "integration"))
+    if not technical_title and any(contains_term(title, term) for term in
+                                   ("fundraising", "advancement", "donor", "growth")):
+        return False, "Fundraising/growth role rather than technical operations"
 
     # Hard block on known-non-remote-US organizations, regardless of title
     # or how the description reads. See COMPANY_HARD_BLOCKLIST comment.
@@ -1013,6 +1084,7 @@ HARD_DISQUALIFIER_PATTERNS = {
 COMPANY_HARD_BLOCKLIST = [
     "brac", "giga", "unicef", "chemonics", "rti international",
     "fhi 360", "forest service international foundation",
+    "stellar development foundation",
 ]
 
 def scan_for_hard_disqualifiers(jd_text):
@@ -1493,37 +1565,16 @@ def extract_company_from_title(page_title):
     return None
 
 def backfill_ffwd_company(job):
-    """
-    If the listing-card scrape came back without a usable company name,
-    recover it from the URL slug (primary — doesn't depend on page
-    metadata, can't fail silently) or the page's <title> tag (fallback).
-
-    Known gap, not fixed here: some FFWD listings (confirmed: BRAC's
-    "Deputy Manager, Sub-Grants (SHIFT)") redirect straight to an external
-    career site (e.g. careers.brac.net/...) rather than a jobs.ffwd.org
-    URL. Neither method below can recover a company name in that case —
-    there's no FFWD company-slug structure to parse and no FFWD-hosted
-    page to fetch a <title> from. The real fix would need to happen
-    upstream in crawl_ffwd(), reading the company name directly off the
-    search-results-page listing card before the external link is ever
-    followed. Tracked here, not fixed — needs its own look at that page's
-    HTML structure first.
-    """
+    """Provisional URL label; matching posting metadata takes precedence later."""
     if job.get("company") and job["company"] not in ("", "Unknown", "See posting"):
         return job
 
     company = extract_company_from_ffwd_url(job.get("url", ""))
 
-    if not company:
-        r = safe_get(job["url"], timeout=20)
-        if r:
-            soup = BeautifulSoup(r.text, "html.parser")
-            if soup.title and soup.title.string:
-                company = extract_company_from_title(soup.title.string.strip())
-
     if company:
         log.info(f"  Backfilled FFWD company name: '{company}'")
         job["company"] = company
+        job["company_source"] = "URL slug (provisional)"
 
     return job
 
@@ -2853,6 +2904,7 @@ def main():
     # Fresh candidates get the first scoring opportunities; historical rechecks go last.
     flush_job_queue(first_scores_only=True)
     flush_job_queue()
+    flag_same_run_employers()
 
 
 if __name__ == "__main__":

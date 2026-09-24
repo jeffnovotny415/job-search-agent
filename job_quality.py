@@ -96,6 +96,15 @@ def legacy_key(job):
 
 def titles_match(first, second):
     def clean(title):
+        # Only a repeated US location suffix, not arbitrary parenthetical qualifiers.
+        # Preserve level/specialty distinctions such as Manager - Data (Analytics).
+        states = set('AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split())
+        suffix = re.search(r'\s+[-–—]\s+([^()]+)\s+\(([^()]+)\)\s*$', title or '')
+        if suffix:
+            place, repeated = suffix[1].strip(), suffix[2].strip()
+            state = re.search(r'\b([A-Z]{2})$', place)
+            if state and state[1] in states and repeated in {place, state[1]}:
+                title = title[:suffix.start()]
         return normalized(re.sub(r"\((?:remote|hybrid)\)|\[.*?\]", "", title or "", flags=re.I))
     a, b = clean(first), clean(second)
     if not a or not b:

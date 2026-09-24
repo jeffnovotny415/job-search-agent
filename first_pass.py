@@ -1,6 +1,7 @@
 """Free screening of listing metadata. Full job vetting belongs to stage two."""
 import base64
 import json
+import math
 import re
 from urllib.parse import unquote, urlsplit
 
@@ -48,7 +49,7 @@ def parse_idealist_html(html):
         pay = next((line for line in remaining[1:] if re.search(r'\$|\b(?:USD|CAD|EUR|GBP)\b', line)), 'Not listed')
         location = clean(' '.join(line for line in remaining[1:] if line != pay)) or 'Not specified'
         jobs[url] = {'title': title, 'company': company, 'url': url, 'salary': pay,
-                     'location': location, 'employment_type': 'part-time' if re.search(r'part[- ]time', title, re.I) else '',
+                     'location': location, 'employment_type': 'contract' if '/consultant-job/' in url else 'part-time' if re.search(r'part[- ]time', title, re.I) else '',
                      'description': '', 'source': 'Idealist (Gmail alert)', 'metadata_source': 'Email listing'}
     expected = sum(int(n) for n in re.findall(r'(\d+) new results? found for this search', soup.get_text(' ', strip=True)))
     # A repeated listing in several saved searches is still one job.
@@ -97,17 +98,17 @@ def posted_pay(value):
     """Return upper offered pay, period, currency, and whether an upper bound exists."""
     text = clean(value)
     try:
-        structured = json.loads(text)
+        structured = value if isinstance(value, dict) else json.loads(text)
     except (ValueError, TypeError):
         structured = None
     if isinstance(structured, dict):
         amount = structured.get('value', structured)
         if isinstance(amount, dict):
-            raw = amount.get('maxValue', amount.get('value', amount.get('minValue')))
+            raw = numeric_amount(amount.get('maxValue', amount.get('value', amount.get('minValue'))))
             period = str(amount.get('unitText', '')).lower()
             period = 'hour' if period in {'hour', 'hourly'} else 'year' if period in {'year', 'annual'} else ''
-            if isinstance(raw, (float, int)):
-                return raw, period, structured.get('currency', 'unknown'), 'maxValue' in amount or 'value' in amount
+            if raw is not None:
+                return raw, period, clean(structured.get('currency', 'unknown')).upper(), 'maxValue' in amount or 'value' in amount
         return None, '', '', False
     text = re.split(r'[|•]', text)[0]
     foreign = re.search(r'\b(CAD|AUD|EUR|GBP|INR)\b|C\$|A\$|€|£', text, re.I)
@@ -124,10 +125,83 @@ def posted_pay(value):
     return upper, period, currency, bool(has_upper)
 
 
+def numeric_amount(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).replace(',', ''))
+        return number if math.isfinite(number) and number >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def structured_value(value):
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def country_name(place):
+    address = place.get('address') if isinstance(place, dict) else None
+    country = address.get('addressCountry') if isinstance(address, dict) else None
+    return clean(country.get('name') if isinstance(country, dict) else country).upper()
+
+
+def display_location(value):
+    obj = structured_value(value)
+    if not obj:
+        return clean(value) or 'Not specified'
+    places = obj.get('jobLocation') or []
+    places = places if isinstance(places, list) else [places]
+    labels = []
+    for place in places:
+        address = place.get('address', {}) if isinstance(place, dict) else {}
+        if isinstance(address, dict):
+            label = ', '.join(filter(None, [clean(address.get('addressLocality')),
+                                           clean(address.get('addressRegion')), country_name(place)]))
+            if label and label not in labels:
+                labels.append(label)
+    restrictions = obj.get('applicantLocationRequirements') or []
+    restrictions = restrictions if isinstance(restrictions, list) else [restrictions]
+    applicants = ', '.join(clean(x.get('name')) for x in restrictions if isinstance(x, dict) and x.get('name'))
+    if 'TELECOMMUTE' in str(obj.get('jobLocationType', '')).upper():
+        labels.append('Remote' + (f' ({applicants} applicants)' if applicants else ''))
+    elif applicants:
+        labels.append(f'Applicants: {applicants}')
+    if obj.get('listingLocation') and obj['listingLocation'] not in labels:
+        labels.append(clean(obj['listingLocation']))
+    return ' · '.join(labels) or 'Location needs verification'
+
+
+def display_pay(value):
+    obj = structured_value(value)
+    if not obj:
+        return clean(value) or 'Not listed'
+    amount = obj.get('value', obj)
+    if not isinstance(amount, dict):
+        return 'Pay needs verification'
+    upper, period, currency, bounded = posted_pay(obj)
+    if upper is None:
+        return 'Pay needs verification'
+    lower = numeric_amount(amount.get('minValue'))
+    prefix = '$' if currency == 'USD' else currency + ' '
+    number = lambda n: f'{n:,.2f}'.rstrip('0').rstrip('.')
+    pay = f'{prefix}{number(upper)}'
+    if lower is not None and lower < upper:
+        pay = f'{prefix}{number(lower)}–{pay}'
+    if not bounded:
+        pay = 'From ' + pay
+    return pay + ({'year':'/yr', 'hour':'/hr'}.get(period, ' (period not specified)'))
+
+
 def screen_metadata(job, annual_floor=90000, contract_floor=65):
     flags = []
     checks = {'title': 'Plausible first-pass match'}
-    location = clean(job.get('location'))
+    location = json.dumps(job['location']) if isinstance(job.get('location'), dict) else clean(job.get('location'))
     lower = location.lower()
     remote = bool(re.search(r'\bremote\b|telecommute|telecommuting|telecommute', lower))
     office = bool(re.search(r'\bhybrid\b|\bon[ -]?site\b|\bin[ -]person\b', lower))
@@ -151,16 +225,23 @@ def screen_metadata(job, annual_floor=90000, contract_floor=65):
         names = {clean(item.get('name')).lower() for item in restrictions if isinstance(item, dict)}
         foreign_countries = {'canada', 'united kingdom', 'uk', 'india', 'australia', 'germany', 'france', 'europe'}
         foreign_only = foreign_only or bool(names and names.issubset(foreign_countries))
+        places = structured_location.get('jobLocation') or []
+        places = places if isinstance(places, list) else [places]
+        countries = {country_name(place) for place in places} - {''}
+        # A foreign job location with no remote signal is incompatible. A foreign
+        # employer's HQ with explicit remote eligibility is not a disqualifier.
+        if countries and not countries & {'US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA'} and not remote:
+            return {'stage': 'first-pass', 'decision': 'skip', 'reason': 'Structured job location is outside the US with no remote eligibility', 'flags': [], 'checks': checks}
     if foreign_only:
         return {'stage': 'first-pass', 'decision': 'skip', 'reason': 'Listing restricts remote work outside the US', 'flags': [], 'checks': checks}
     checks['location'] = location or 'Not specified'
     if not re.search(r'\bunited states\b|\bu\.?s\.?a?\b|\bworldwide\b|\beverywhere\b', lower):
         flags.append('Verify geographic eligibility for a northeastern US applicant')
-    pay = clean(job.get('salary')) or 'Not listed'
+    pay = json.dumps(job['salary']) if isinstance(job.get('salary'), dict) else clean(job.get('salary')) or 'Not listed'
     upper, period, currency, bounded = posted_pay(pay)
     employment = clean(job.get('employment_type')) + ' ' + job.get('title', '')
     part_time = bool(re.search(r'part[- _]?time', employment, re.I))
-    contract = bool(re.search(r'\bcontract(?:or)?\b|\bfreelance\b|\b1099\b', employment, re.I))
+    contract = '/consultant-job/' in job.get('url', '') or bool(re.search(r'\bcontract(?:or)?\b|\bfreelance\b|\b1099\b', employment, re.I))
     checks['salary'] = pay
     reason = None
     if upper is None or not period or currency != 'USD':
@@ -190,8 +271,8 @@ def screen_metadata(job, annual_floor=90000, contract_floor=65):
             'flags': flags, 'checks': checks}
 
 
-def extract_listing_metadata(html, expected_title=''):
-    """Read factual JSON-LD fields to recover missing employers; never score a JD."""
+def extract_listing_metadata(html, expected_title='', page_url=''):
+    """Read factual JSON-LD fields and JD text for free deterministic screening."""
     from job_quality import titles_match
     def objects(value):
         if isinstance(value, dict):
@@ -223,4 +304,71 @@ def extract_listing_metadata(html, expected_title=''):
         result['location'] = json.dumps(location, ensure_ascii=False)
     if obj.get('baseSalary'):
         result['salary'] = json.dumps(obj['baseSalary'], ensure_ascii=False)
+    if isinstance(obj.get('description'), str) and obj['description'].strip():
+        result['description'] = BeautifulSoup(obj['description'], 'html.parser').get_text(' ', strip=True)
+        result['description_verified'] = True
+    # These sources truncate JSON-LD or omit a separate benefits/eligibility section.
+    # Use only the matching posting's known container, never related-job page text.
+    soup = BeautifulSoup(html, 'html.parser')
+    heading = soup.select_one('main h1')
+    host = urlsplit(page_url).hostname or ''
+    if heading and titles_match(obj.get('title'), heading.get_text(' ', strip=True)):
+        sections = soup.select('article .prose') if host == 'remoteimpact.org' else []
+        if host in {'idealist.org', 'www.idealist.org'}:
+            sections = soup.select('main')
+        if sections:
+            visible = ' '.join(section.get_text(' ', strip=True) for section in sections)
+            result['description'] = result.get('description', '') + '\n' + visible
+            result['description_verified'] = True
     return {k: v for k, v in result.items() if v}
+
+
+def explicit_description_exclusions(text, location=''):
+    """Narrow requirements, not the legacy scorer's broad warning keywords."""
+    hits = []
+    # A negation/optional statement never supplies evidence of a requirement.
+    for sentence in re.split(r'(?<=[.!?;])\s+|\n+', text or ''):
+        sentence = clean(sentence).lower()
+        # Split independent clauses so 'no sponsorship, but travel is required'
+        # can still provide positive travel evidence.
+        for clause in re.split(r'\bbut\b|\bhowever\b', sentence):
+            def positive(pattern):
+                for match in re.finditer(pattern, clause):
+                    before = clause[max(0, match.start() - 60):match.start()]
+                    after = clause[match.end():match.end() + 45]
+                    if re.search(r'\b(?:no|not|never|without)\b', match[0]):
+                        continue
+                    if re.search(r'\b(?:no|not|never|without)\b[^,;:.]{0,50}$', before):
+                        continue
+                    if re.match(r'\s*(?:is |are |will be )?(?:not required|optional|not necessary|not expected)', after):
+                        continue
+                    return True
+                return False
+            office = (r'\bhybrid (?:work )?(?:schedule|role|position|arrangement)\b',
+                      r'\b(?:fully |full[- ]time[, ]+)?on[- ]?site (?:role|position|work)\b',
+                      r'\b(?:role|position) (?:is|will be) (?:fully )?on[- ]?site\b',
+                      r'\b(?:must|required to|expected to) (?:work|be|come) (?:from |in |into |at )?(?:our |the )?office\b',
+                      r'\b\d+ days? (?:a|per) week (?:in|at) (?:the |our )?office\b',
+                      r'\bin[- ]office\b.{0,40}\b(?:days? (?:a|per) week|monday|tuesday|wednesday|thursday|friday)\b',
+                      r'\bmonday\s*(?:through|to|[-–])\s*friday\b.{0,40}\b(?:office|on[- ]?site)\b')
+            optional_remote = re.search(r'\b(?:onsite|on-site|hybrid)\s+(?:or|/)\s+remote|\bremote\s+(?:or|/)\s+(?:onsite|on-site|hybrid)', clause)
+            if not optional_remote and any(positive(p) for p in office):
+                hits.append('Explicit hybrid/on-site work requirement')
+            if positive(r'\b(?:requires?|required|must|expected to)\b.{0,35}\b(?:regular|extensive|frequent) travel\b') or positive(r'\b(?:regular|extensive|frequent) travel\b.{0,25}\b(?:required|expected)\b'):
+                hits.append('Regular/extensive travel required')
+            for match in re.finditer(r'\btravel\b[^.;]{0,35}?(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?)\s*)?%', clause):
+                if max(float(match[1]), float(match[2] or match[1])) > 10 and positive(re.escape(match[0])):
+                    hits.append('Listed travel exceeds 10%')
+            for match in re.finditer(r'\b(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?)\s*)?%\s+(?:required\s+)?travel\b', clause):
+                if max(float(match[1]), float(match[2] or match[1])) > 10 and positive(re.escape(match[0])):
+                    hits.append('Listed travel exceeds 10%')
+            if positive(r'\bcalifornia residents only\b') or positive(r'\bunable to (?:offer employment|hire)\b.{0,45}\bnon[- ]california residents\b'):
+                hits.append('California residency required')
+            if positive(r'\blocal candidates only\b') and re.search(r'\b(?:california|san francisco|bay area|san diego|los angeles)\b', display_location(location).lower() + ' ' + clause):
+                hits.append('Local candidates required')
+            # Ownership of customer revenue, rather than a neighboring team's name.
+            if positive(r'\b(?:manage[sd]?|own[sd]?|responsible for)\b.{0,60}\b(?:(?:account|customer|client) renewals?|upselling|sales quotas?)\b') or positive(r'\baccounts?\b.{0,30}\bthrough (?:to )?renewal\b'):
+                hits.append('Role owns customer accounts/renewals')
+            elif positive(r'\bown\b.{0,35}\brelationship\b.{0,65}\b(?:client|customer|utility) accounts\b'):
+                hits.append('Role owns customer accounts/renewals')
+    return list(dict.fromkeys(hits))
