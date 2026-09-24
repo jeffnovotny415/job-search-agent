@@ -10,8 +10,8 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-POLICY_VERSION = "2026-09-evidence-v1"
-UNKNOWN_COMPANIES = {"", "unknown", "see posting", "not listed", "n a"}
+POLICY_VERSION = "2026-09-first-pass-v1"
+UNKNOWN_COMPANIES = {"", "unknown", "see posting", "not listed", "n a", "not provided", "confidential", "confidential employer", "company not listed"}
 RETRY_STATES = {"score_failed", "delivery_failed", "description_unavailable", "needs_review", "budget_deferred"}
 TRACKING_PARAMETERS = {"gh_src", "source", "ref", "referral", "mc_cid", "mc_eid"}
 
@@ -131,7 +131,7 @@ def parse_date(value):
 
 
 def legacy_retryable(entry, job):
-    return (entry.get("scored") is False or entry.get("verdict") == "Score withheld" or
+    return (entry.get("scored") is False or entry.get("verdict") in {"Score withheld", "Skip", "Maybe", "Maybe / Stretch"} or
             (entry.get("verdict") == "Pre-filtered" and
              "salesforce" in job.get("title", "").lower()))
 
@@ -162,6 +162,9 @@ def should_process(seen, job, now=None):
     entry = cache_entry(seen, job)
     if not entry:
         return True
+    if (entry.get("policy_version") != POLICY_VERSION and
+            entry.get("status") in {"rejected", "below_threshold", "needs_review", "description_unavailable", "score_failed", "budget_deferred"}):
+        return True  # reconsider previous deep-vet exclusions only when the role is rediscovered
     if entry.get("status") not in RETRY_STATES:
         return False
     # A deferral is governed by the daily spending ledger, not a rolling 24h delay.
@@ -181,11 +184,15 @@ def record_decision(seen, job, status, reason, result=None, card_id=None):
         "url": job.get("url", ""), "source": job.get("source", ""),
         "date": now.isoformat(), "status": status, "reason": reason,
         "policy_version": POLICY_VERSION, "attempts": attempts,
+        "location": job.get("location"), "salary": job.get("salary"),
+        "employment_type": job.get("employment_type"),
         "description_source": job.get("description_source"),
         "description_sha256": hashlib.sha256(job.get("description", "").encode()).hexdigest(),
     }
     if result:
-        entry.update(score=result["score"], verdict=result["verdict"], result=result)
+        entry["result"] = result
+        if "score" in result:
+            entry.update(score=result["score"], verdict=result.get("verdict"))
     if card_id:
         entry["card_id"] = card_id
     if status in RETRY_STATES:

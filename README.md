@@ -1,34 +1,30 @@
 # Job Search Agent
 
-A personal job search automation tool I built while actively looking for work in 2026. It crawls mission-aligned job boards, scores each role against my specific profile using the Claude API, creates Trello cards for strong matches, and scans Gmail to automatically move pipeline cards when rejections or interview invites arrive.
-
-I built this because I was spending 2-3 hours a day manually checking job boards, copying listings into a tracker, and trying to remember which applications had heard back. This runs every morning in about 5-10 minutes and handles all of that automatically.
-
----
+This is the inexpensive discovery and first-screen stage of a two-stage job search. It collects listings, checks title/location/remote/pay metadata, and places promising **named-company** leads in Trello. A separate Claude project does the deep vet: full descriptions, employer websites, responsibilities, credentials, and overall suitability.
 
 ## What it does
 
-**Job crawling**
-Scrapes three mission-aligned job boards daily and reads Idealist email alerts:
-- [Remote Impact](https://remoteimpact.org) — remote roles at impact-driven orgs
-- [Tech Jobs for Good](https://techjobsforgood.com) — tech roles at nonprofits and social enterprises
-- [FFWD Jobs](https://jobs.ffwd.org) — Fast Forward nonprofit tech job board
-- Idealist via Gmail digests, followed by fetching each actual posting
-- LinkedIn and Built In alert integrations are available but disabled
+**Discovery**
+- [Remote Impact](https://remoteimpact.org)
+- [Tech Jobs for Good](https://techjobsforgood.com)
+- [FFWD Jobs](https://jobs.ffwd.org)
+- Idealist and Wellfound saved-search/recommendation emails in Gmail
+- LinkedIn and Built In integrations remain disabled
 
-**Intelligent scoring**
-Each new job is scored 0-100 against a detailed personal profile using Claude (Anthropic's API). The profile encodes:
-- Three resume lanes (IT Ops, Technical PM, AI Workflow)
-- Hard disqualifiers (sales roles, onsite requirements, crypto, revenue cycle)
-- Mission alignment scoring (edtech, civic tech, climate, nonprofits score higher)
-- Ownership language signals ("build from scratch," "first hire," "small team" get a boost)
-- Company size flags (under 50 = positive signal, over 500 = bureaucracy risk noted)
+**Free first-pass screening**
+- Title must indicate IT, technical project/program work, AI workflow, or adjacent operations.
+- Clear mismatches such as camp directors, legal officers, sales, and HR are skipped.
+- Explicit hybrid/on-site listings and clear remote-country restrictions outside the US are skipped. A city by itself does not establish an office requirement.
+- Skip annual salary ranges whose maximum is below **$90,000**, except explicitly part-time roles.
+- Contract/hourly listings must reach **$65/hour**; explicitly part-time employee roles retain the salary exception.
+- Missing salary, unclear remote eligibility, geographic restrictions, or ambiguous pay units are flagged for the Claude project instead of silently discarded.
+- Known employers do not require a full-description fetch. Missing names get a free structured-metadata lookup; if the name cannot be recovered, no unnamed card is created.
 
-**Trello integration**
-Roles scoring 60+ with verified job descriptions and supported eligibility evidence get a Trello card in Watching. Incomplete or ambiguous jobs go into the private review/retry report, not Watching. Each card includes the score, verdict, resume lane recommendation, mission fit rating, concerns, cover letter angle, and a specific portfolio project.
+**Trello handoff**
+Cards in Watching say **First-pass lead — awaiting Claude deep vet**. They include employer, source link, listed location/pay, and specific facts to verify. They do not claim to be fully vetted, assign a suitability score, or invent salary recommendations or remote eligibility.
 
 **Gmail pipeline tracking**
-Scans the inbox daily for emails from active pipeline companies. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also parses job alert digest emails from Idealist, LinkedIn, and Built In to extract and score new listings.
+Scans the inbox daily for emails from active pipeline companies. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also reads job alert emails to extract basic listing metadata.
 
 **Pre-filtering**
 A cheap keyword pre-filter runs before any Claude API calls, skipping obvious mismatches (sales titles, engineering roles, etc.) without spending API tokens. Saves roughly 30-40% of API costs on a typical run.
@@ -53,7 +49,7 @@ Watching → Applied → Interview → Offer → Closed
 ## Tech stack
 
 - Python 3.x
-- [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) — Claude API for scoring and classification
+- [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) — Claude API for application-status classification
 - [Requests](https://requests.readthedocs.io) + [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — job board scraping
 - [Google Gmail API](https://developers.google.com/gmail/api) — inbox scanning and email parsing
 - [Trello REST API](https://developer.atlassian.com/cloud/trello/rest/) — pipeline card management
@@ -134,83 +130,47 @@ python3 jeff_job_agent.py --gmail
 
 Production runs in a separate private GitHub runner repository, keeping personal state and logs private. A Claude routine triggers its `workflow_dispatch` each morning. GitHub's `schedule` trigger is disabled. A concurrency guard prevents overlapping runs.
 
-Deploy these together: `jeff_job_agent.py`, `job_quality.py`, `api_budget.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
+Deploy these together: `jeff_job_agent.py`, `first_pass.py`, `job_quality.py`, `api_budget.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
 
 
 ---
 
-## API cost controls
+## Cost controls and screening rules
 
-The configured daily Claude API cap is **$0.75**, resetting at midnight America/New_York. It covers scoring, digest extraction, and email classification across repeated runs of this agent. Other tools or subscriptions are outside this ledger.
+The API spending ceiling remains **$0.75/day**, resetting at midnight America/New_York. It is a safety limit, not a spending target. Existing daily usage is preserved across reruns and deployments.
 
-Before each paid request, the agent uses the unbilled token-count endpoint and reserves a conservative input/full-output charge. It reconciles that reservation with returned usage afterward. Timeouts retain their reservation because the provider may have completed the request. SDK automatic retries are disabled. Pricing is pinned to the documented Sonnet 4.6 rates; a model change requires an explicit pricing update.
+**Job screening and Idealist/Wellfound HTML parsing make no paid model calls.** The application-status classification and reconciliation features can still use the API. They retain their cached decisions and the same spending guard. The older disabled LinkedIn/Built In parsers also use the guard if explicitly re-enabled.
 
-- Completed digest sections are extracted once and cached across runs.
-- Pending digest input survives the Gmail lookback window.
-- Stable profile/portfolio input uses prompt caching.
-- Delivery retries reuse the saved score.
-- Unchanged ambiguous evidence reuses the prior assessment instead of paying again.
-- Jobs beyond the daily cap remain queued. New plausible roles get first priority, followed by budget-deferred jobs, then historical rechecks. Budget-deferred jobs can retry on the next run without waiting a full 24 hours; the same daily ledger still enforces the cap. A fixed cap can still defer jobs on a busy day.
-- Idealist sections are split into batches of at most five linked jobs. Each completed batch is saved immediately; jobs get a scoring opportunity before the next extraction. A timeout retries only unfinished batches on a later run.
-- Board navigation links are removed before collection counts and old navigation retries are retired without scoring.
-- Camp director and legal officer/counsel titles are filtered before fetching descriptions or scoring. Technical roles at camps and legal organizations remain eligible.
-- Explicit hybrid/on-site requirements in verified descriptions are filtered before paid scoring. Remote alternatives, ambiguous wording, addresses, and occasional office visits still get evidence-based evaluation.
-- Missing optional score metadata (such as a salary suggestion) gets a safe default. Eligibility evidence and the numeric score remain required.
+- Parse job-card HTML directly, retaining title, employer, location, salary, and links.
+- Keep incomplete input for review; do not silently substitute an empty successful extraction.
+- Recover old Idealist backlog from saved metadata, current emails, or at most 20 free structured-data fetches per run.
+- Wellfound's public pages may block HTTP clients. First-pass leads can use email metadata; a full description is not required at this stage. Only job-card redirect links are followed, never unsubscribe or preference controls.
+- Deduplicate against every Trello list and archived passes before creating cards.
+- Reconsider prior deep-score rejections on rediscovery under the new first-pass policy. Existing delivered/archived cards remain protected.
+- Preserve failed deliveries and missing-employer cases for retry; new leads are handled before older rechecks.
 
-The private Actions summary reports reserved/reconciled API usage, outcomes, and source health. Runs explicitly report `complete`, `partial`, or `failed`. Isolated source or extraction problems and budget deferrals are partial results; fatal phase errors and total source outages still fail the workflow. Its artifact includes `run_report.json` and `review_jobs.json`. A day with no suitable matches is distinct from failed collection or a reached budget cap. Older README per-job cost estimates were not measured and should not be used.
-
-
----
-
-## Configuration reference
-
-Key settings at the top of `jeff_job_agent.py`:
-
-| Setting | Default | Description |
+| Setting | Default | Purpose |
 |---|---|---|
-| `min_score_for_card` | 60 | Minimum score to create a Trello card |
-| `gmail_lookback_days` | 7 | How far back to scan Gmail |
-| `seen_jobs_file` | `seen_jobs.json` | Local cache of processed jobs |
-| `log_file` | `job_agent.log` | Full run log |
-| `daily_api_budget_usd` | 0.75 | Agent-wide daily API spending cap |
-| `max_retry_jobs_per_run` | 8 | Historical rechecks after fresh candidates |
-| `max_description_chars` | 30000 | Oversized descriptions go to review; no silent cut-off |
+| `annual_salary_floor` | 90000 | Reject full-time salary ranges entirely below this floor |
+| `contract_hourly_floor` | 65 | Minimum viable contract/hourly rate |
+| `enable_wellfound_alerts` | true | Read existing Wellfound emails |
+| `gmail_lookback_days` | 7 | Recent discovery/status emails |
+| `daily_api_budget_usd` | 0.75 | Cap remaining model-assisted status tracking |
+| `max_retry_jobs_per_run` | 8 | Historical job rechecks per run |
+| `max_legacy_metadata_per_run` | 20 | Bound free legacy backlog recovery requests |
 
----
+The private Actions summary distinguishes `complete`, `partial`, and `failed`, with actual outcomes and API usage. An empty candidate list, inaccessible source, and reached API cap are different outcomes. Run artifacts include `run_report.json` and `review_jobs.json`.
 
-## How the scoring works
-
-Each job is scored out of 100 across seven dimensions:
-
-| Dimension | Weight |
-|---|---|
-| Role fit (matches one of three resume lanes) | 25 pts |
-| Lifestyle fit (remote, travel, schedule) | 20 pts |
-| Salary and benefits | 15 pts |
-| Mission alignment | 15 pts |
-| Growth path | 10 pts |
-| Posting quality (verified live link) | 10 pts |
-| Application efficiency | 5 pts |
-
-**Verdict bands:**
-- 85-100: Apply Now
-- 70-84: Apply If Interested
-- 55-69: Maybe / Stretch
-- Below 55: Skip
-
-Hard disqualifiers override the score. The scorer returns supporting excerpts for remote eligibility, travel, schedule, work, and credentials; unsupported claims become unknown. Remote and role-fit evidence must be supported before a card is created. Titles alone do not establish eligibility. Posted salary evidence is separate from a suggested salary ask.
-
-Idealist often includes a complete `JobPosting` JSON-LD payload in the initial HTML, so JavaScript execution is not required for those listings. The extractor verifies the role and includes separate benefits/location sections. Generic employer careers pages are never substituted for a specific job description. Blocked or expired pages can still occur.
-
-Bonus signals: roles mentioning "build from scratch," "first hire," "small team," or "you'll own" get up to +15 points — these phrases correlate with the environments that actually work for me.
+The Claude daily trigger is unchanged. Wellfound alerts observed at 9:25 AM Eastern arrive after the observed 7:20 AM run; the next daily run picks those up unless the trigger time is adjusted separately.
 
 ---
 
 ## Project structure
 
 ```
-jeff_job_agent.py    # Crawlers, scoring, Gmail/Trello orchestration
-job_quality.py      # Evidence extraction, validation, identity, retry policy
+jeff_job_agent.py    # Crawlers, Gmail/Trello orchestration
+first_pass.py        # Free metadata screening and HTML email parsers
+job_quality.py      # Job identity, duplicate detection, retry policy
 api_budget.py       # Persistent daily API spending guard
 tests/              # Offline regression tests
 .env.example         # Credential template — copy to .env
@@ -230,13 +190,13 @@ I'm a technical operations and AI workflow professional with 15+ years of experi
 
 The agent reflects the same approach I take to all operational work: find the repeatable process, build something that handles it consistently, and free up human attention for the decisions that actually require it.
 
-The Claude-powered scoring and classification is not theoretical — it's running daily against my actual job search, and it found and correctly scored several roles I ended up applying to.
+The automation discovers leads; my separate Claude project evaluates them deeply before I decide whether to apply.
 
 ---
 
 ## Notes
 
 - LinkedIn and Built In are sourced via Gmail alert email parsing rather than direct scraping — both platforms block automated crawlers
-- Idealist discovery uses email digests; full descriptions are extracted from the specific public listing when available.
+- Idealist and Wellfound discovery uses email metadata; full descriptions are checked in the separate Claude project.
 - Do not clear the cache to deploy fixes: it preserves prior decisions and retry state. Run `python3 -m unittest discover -s tests -v` to verify the regression suite without spending API credits or touching Trello.
-- The script is opinionated about what constitutes a good fit for my specific background; fork and modify the `JEFF_PROFILE` constant and filter lists to adapt it for your own search
+- Adapt the first-pass CONFIG thresholds and title filters for another search; the detailed Claude-project instructions are managed separately.

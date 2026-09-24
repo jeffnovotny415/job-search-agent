@@ -72,7 +72,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual('',q.canonical_url('https://example.org/jobs'))
 
     def test_legacy_migration_preserves_data(self):
-        j=job(); old={'verdict':'Skip','score':20}; seen={q.legacy_key(j):old}
+        j=job(); old={'verdict':'Apply If Interested','score':80}; seen={q.legacy_key(j):old}
         self.assertFalse(q.should_process(seen,j))
         self.assertIn(q.legacy_key(j),seen)
         self.assertTrue(q.should_process(seen,job(url='https://example.org/jobs/456')))
@@ -147,16 +147,20 @@ class PipelineTests(unittest.TestCase):
         self.config.start();self.addCleanup(self.config.stop)
         agent._PROCESSED_THIS_RUN.clear()
         self.seen={};self.cards=[]
+        no_network=patch('requests.sessions.Session.request', side_effect=AssertionError('Offline tests must not use network'))
+        no_network.start();self.addCleanup(no_network.stop)
+        delivery=patch.object(agent,'create_trello_card',return_value={'id':'fixture'})
+        delivery.start();self.addCleanup(delivery.stop)
 
-    def test_description_failure_creates_no_card_and_retries(self):
-        with patch.object(agent,'enrich_job_description',return_value=job(description_verified=False)), patch.object(agent,'create_trello_card') as create:
-            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'description_unavailable')
-            create.assert_not_called()
-        self.assertIn('retry_after',self.seen[q.posting_key(job())])
+    def test_blocked_description_does_not_block_metadata_lead(self):
+        with patch.object(agent,'enrich_job_description') as fetch, patch.object(agent,'budgeted_message') as api:
+            self.assertEqual(agent.process_job(job(description_verified=False),self.seen,self.cards,'list'),'created')
+            fetch.assert_not_called();api.assert_not_called()
 
-    def test_score_failure_is_retryable(self):
-        with patch.object(agent,'enrich_job_description',return_value=job()), patch.object(agent,'score_job_with_claude',return_value=None):
-            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'score_failed')
+    def test_screening_never_calls_paid_scorer(self):
+        with patch.object(agent,'score_job_with_claude',side_effect=AssertionError('Do not score')) as scorer:
+            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'created')
+            scorer.assert_not_called()
 
     def test_delivery_failure_retries_without_rescoring(self):
         with patch.object(agent,'enrich_job_description',return_value=job()), patch.object(agent,'score_job_with_claude',return_value=score()), patch.object(agent,'create_trello_card',side_effect=RuntimeError('temporary')):
@@ -179,11 +183,12 @@ class PipelineTests(unittest.TestCase):
             agent.process_job(job(),self.seen,self.cards,'list')
             self.assertEqual(create.call_count,1)
 
-    def test_valid_unknown_location_does_not_create_card(self):
-        x=score();x['needs_review']=True
-        with patch.object(agent,'enrich_job_description',return_value=job()),patch.object(agent,'score_job_with_claude',return_value=x),patch.object(agent,'create_trello_card') as create:
-            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'needs_review')
-            create.assert_not_called()
+    def test_unknown_location_creates_flagged_lead(self):
+        candidate=job(location='Not specified', salary='Not listed')
+        self.assertEqual(agent.process_job(candidate,self.seen,self.cards,'list'),'created')
+        result=self.seen[q.posting_key(candidate)]['result']
+        self.assertEqual(result['checks']['remote'],'Needs verification')
+        self.assertTrue(result['flags'])
 
     def test_digest_extraction_is_paid_only_once(self):
         from types import SimpleNamespace
@@ -195,17 +200,17 @@ class PipelineTests(unittest.TestCase):
             second=agent.extract_idealist_section_listings(object(),'Digest',section)
             self.assertEqual(first,second);self.assertEqual(call.call_count,1)
 
-    def test_budget_deferred_job_is_kept(self):
+    def test_budget_limit_does_not_stop_free_screening(self):
         from api_budget import BudgetExceeded
-        with patch.object(agent,'enrich_job_description',return_value=job()),patch.object(agent,'score_job_with_claude',side_effect=BudgetExceeded()):
-            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'budget_deferred')
-        self.assertIn('job',self.seen[q.posting_key(job())])
+        with patch.object(agent,'budgeted_message',side_effect=BudgetExceeded()) as api:
+            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'created')
+            api.assert_not_called()
 
-    def test_unchanged_review_does_not_pay_again(self):
+    def test_previous_deep_review_becomes_flagged_first_pass_lead(self):
         q.record_decision(self.seen,job(),'needs_review','uncertain',score())
-        self.seen[q.posting_key(job())]['retry_after']='2020-01-01T00:00:00Z'
-        with patch.object(agent,'enrich_job_description',return_value=job()),patch.object(agent,'score_job_with_claude') as scorer:
-            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'needs_review')
+        self.seen[q.posting_key(job())]['policy_version']='2026-09-evidence-v1'
+        with patch.object(agent,'score_job_with_claude') as scorer:
+            self.assertEqual(agent.process_job(job(),self.seen,self.cards,'list'),'created')
             scorer.assert_not_called()
 
     def test_empty_pipeline_still_reads_idealist(self):

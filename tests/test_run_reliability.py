@@ -32,6 +32,10 @@ class ReliabilityTests(unittest.TestCase):
             _DEFERRED_EXTRACTIONS={}, _EXTRACTION_ATTEMPTS=set(), _PROCESSED_THIS_RUN=set(),
             RUN_REPORT={'sources': {}, 'counts': {}, 'jobs': [], 'warnings': [], 'errors': []})
         state.start(); self.addCleanup(state.stop)
+        network=patch('requests.sessions.Session.request', side_effect=AssertionError('Offline tests must not use network'))
+        network.start();self.addCleanup(network.stop)
+        delivery=patch.object(agent,'create_trello_card',return_value={'id':'fixture'})
+        delivery.start();self.addCleanup(delivery.stop)
 
     def test_partial_warning_does_not_mean_failed(self):
         agent.RUN_REPORT['warnings'] = ['One extraction timed out']
@@ -171,26 +175,32 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(agent._COLLECT_JOBS)
 
     def test_gmail_batch_delivery_survives_outer_state_save(self):
+        from unittest.mock import Mock
+        import base64
         section, urls = digest(1)
-        body = f'Here are your new updates for "IT" jobs: {section["raw_text"]} 1 new result found for this search'
+        html = f'<p><a href="{urls[0]}">IT Manager</a><br>Example Foundation<br>USD $100,000 / year<br>Remote, United States</p><p>1 new result found for this search</p>'
+        service=Mock()
+        service.users.return_value.messages.return_value.get.return_value.execute.return_value={'payload':{'mimeType':'text/html','body':{'data':base64.urlsafe_b64encode(html.encode()).decode()}}}
         agent._COLLECT_JOBS = True
-        with patch.object(agent, 'get_gmail_service', return_value=object()), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_all_active_cards', return_value=[]), patch.object(agent, 'load_seen_emails', return_value={}), patch.object(agent, 'save_seen_emails'), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'search_gmail', return_value=[{'id': 'email', 'subject': 'Digest', 'snippet': ''}]), patch.object(agent, 'get_email_body', return_value=body), patch.object(agent.anthropic, 'Anthropic'), patch.object(agent, 'budgeted_message', return_value=response(urls)), patch.object(agent, 'enrich_job_description', side_effect=lambda candidate: job(**candidate, description_verified=True)), patch.object(agent, 'score_job_with_claude', return_value=score()), patch.object(agent, 'create_trello_card', return_value={'id': 'new'}), patch.object(agent, 'run_gmail_trello_reconciliation'):
+        with patch.object(agent, 'get_gmail_service', return_value=service), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_all_active_cards', return_value=[]), patch.object(agent, 'load_seen_emails', return_value={}), patch.object(agent, 'save_seen_emails'), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'search_gmail', side_effect=lambda _,query,**kwargs: [{'id':'email','subject':'Digest','snippet':''}] if 'idealist' in query else []), patch.object(agent, 'budgeted_message') as api, patch.object(agent, 'run_gmail_trello_reconciliation'):
             agent.run_gmail_scan()
+            api.assert_not_called()
         self.assertEqual(agent.load_seen_jobs()[q.posting_key({'url': urls[0]})]['status'], 'created')
 
     def test_main_scores_both_fresh_sources_before_historical_retry(self):
-        old = job(url='https://example.org/jobs/old'); fresh = job(url='https://example.org/jobs/fresh')
-        mail = job(url='https://example.org/jobs/mail'); seen = {}; order = []
+        old = job(company='Old Foundation',url='https://example.org/jobs/old'); fresh = job(company='Fresh Foundation',url='https://example.org/jobs/fresh')
+        mail = job(company='Mail Foundation',url='https://example.org/jobs/mail'); seen = {}; order = []
         q.record_decision(seen, old, 'score_failed', 'Retry')
         seen[q.posting_key(old)]['retry_after'] = '2020-01-01T00:00:00Z'
         agent.save_seen_jobs(seen)
         def crawl():
             for candidate in [old, fresh]:
                 agent.process_job(candidate, seen, [], 'w')
-        def scorer(candidate):
-            order.append(candidate['url'])
-            return {**score(), 'disqualified': True}
-        with patch('sys.argv', ['agent']), patch.object(agent, 'run_job_crawl', side_effect=crawl), patch.object(agent, 'run_gmail_scan', side_effect=lambda: agent.collect_idealist_batch([mail])), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'enrich_job_description', side_effect=lambda candidate: {**job(), **candidate, 'description_verified': True}), patch.object(agent, 'score_job_with_claude', side_effect=scorer):
+        def deliver(_, title, description):
+            import re
+            order.append(re.search(r'\*\*URL:\*\* (.+)',description)[1])
+            return {'id':str(len(order))}
+        with patch('sys.argv', ['agent']), patch.object(agent, 'run_job_crawl', side_effect=crawl), patch.object(agent, 'run_gmail_scan', side_effect=lambda: agent.collect_idealist_batch([mail])), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'create_trello_card', side_effect=deliver):
             agent.main()
         self.assertEqual(order, [fresh['url'], mail['url'], old['url']])
 
@@ -233,14 +243,12 @@ class ReliabilityTests(unittest.TestCase):
             agent.flush_job_queue(first_scores_only=True)
             self.assertEqual(process.call_count, 3)
 
-    def test_explicit_office_requirement_skips_paid_scoring(self):
-        for requirement in ['This role is hybrid.', 'This position is fully on-site.',
-                            'Employees must work in the office three days per week.',
-                            'This job is not remote.']:
-            candidate = job(description='Manage internal SaaS systems. ' * 15 + requirement)
+    def test_explicit_office_metadata_skips_paid_scoring(self):
+        for location in ['Hybrid', 'On-site in Boston', 'Hybrid (remote two days)', 'Not remote']:
+            candidate=job(location=location)
             agent._PROCESSED_THIS_RUN.clear()
-            with self.subTest(requirement=requirement), patch.object(agent, 'enrich_job_description', return_value=candidate), patch.object(agent, 'score_job_with_claude') as api:
-                self.assertEqual(agent.process_job(candidate, {}, [], 'w'), 'filtered')
+            with self.subTest(location=location), patch.object(agent,'budgeted_message') as api:
+                self.assertEqual(agent.process_job(candidate,{},[],'w'),'filtered')
                 api.assert_not_called()
 
     def test_ambiguous_remote_wording_and_optional_travel_are_not_cheap_rejections(self):

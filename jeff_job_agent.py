@@ -2,8 +2,8 @@
 """
 Jeff's Job Search Agent
 =======================
-Crawls target job sites, scores each role against Jeff's profile using Claude,
-creates Trello cards for strong matches, and scans Gmail to move cards
+Crawls job boards and email alerts, screens basic listing metadata without AI,
+creates named Trello leads for a separate Claude deep vet, and scans Gmail to move cards
 between pipeline stages automatically.
 
 Run manually:         python jeff_job_agent.py
@@ -38,6 +38,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import base64
 from api_budget import DailyBudget, BudgetExceeded
+from first_pass import (screen_metadata, email_html, parse_idealist_html, parse_wellfound_html,
+                        extract_listing_metadata, idealist_url)
 from job_quality import (
     POLICY_VERSION, RETRY_STATES, atomic_json, canonical_url,
     contains_term, extract_posting, find_duplicate, known_company,
@@ -84,8 +86,11 @@ CONFIG = {
     "gmail_credentials_file": "credentials.json",
     "gmail_token_file":       "gmail_token.json",
 
-    # Score threshold — only create Trello cards for roles at or above this
-    "min_score_for_card": 60,
+    # First-stage metadata screen; deep vetting happens in the separate Claude project.
+    "annual_salary_floor": 90000,
+    "contract_hourly_floor": 65,
+    "enable_wellfound_alerts": True,
+    "max_legacy_metadata_per_run": 20,
 
     # Alert-email sources to scan for job listings. Idealist stays on;
     # LinkedIn and Built In are switched off (2026-08) — their alerts
@@ -382,62 +387,68 @@ def process_job(job, seen, existing_cards, watching_list_id):
     if match:
         return finish("duplicate", "Previously passed on" if match.get("closed") else
                       f"Already in {match['list_name']}", card_id=match["card_id"])
-    should_score, reason = pre_filter(job)
+    should_score, reason = pre_filter({**job, "description": ""})
     if not should_score:
         return finish("filtered", reason)
-    previous = seen.get(key, {})
-    if previous.get("status") == "delivery_failed" and previous.get("result"):
-        # Successful scoring is durable; retry only the failed delivery.
-        result = previous["result"]
-    else:
-        job = enrich_job_description(job)
-        if not job.get("description_verified"):
-            return finish("description_unavailable", job.get("description_error", "No verified description"))
-        if job.get("expired"):
-            return finish("expired", "Posting is closed or past its stated expiry")
-        office_requirement = explicit_office_requirement(job)
-        if office_requirement:
-            return finish("filtered", "Explicit office requirement: " + office_requirement)
+    if not title_is_plausible(job):
+        return finish("filtered", "Title does not indicate an IT, technical project, AI, or adjacent operations role")
+    result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
+    if result["decision"] == "skip":
+        return finish("filtered", result["reason"], result)
+    if not known_company(job.get("company")):
+        # A missing employer is the only reason this stage needs a posting fetch.
+        # Structured metadata is free; inaccessible pages never trigger paid retries.
+        response = safe_get(job.get("url", ""), timeout=15) if canonical_url(job.get("url")) else None
+        if response is not None:
+            job.update(extract_listing_metadata(response.text, job.get("title", "")))
         if not known_company(job.get("company")):
-            return finish("needs_review", "Employer could not be verified")
-        if len(job.get("description", "")) > CONFIG["max_description_chars"]:
-            return finish("needs_review", "Description exceeds scoring limit; no text was silently dropped")
-        # Employer recovery and the full description may expose a hard exclusion.
-        should_score, reason = pre_filter(job)
-        if not should_score:
-            return finish("filtered", reason)
+            return finish("needs_review", "Employer name unavailable; no unnamed Trello card created")
+        if not pre_filter({**job, "description": ""})[0] or not title_is_plausible(job):
+            return finish("filtered", "Recovered listing metadata does not match first-pass title/employer filters")
+        result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
+        if result["decision"] == "skip":
+            return finish("filtered", result["reason"], result)
         match = find_duplicate(job, existing_cards, clean_company_name)
         if match:
             return finish("duplicate", "Existing card found after employer recovery", card_id=match["card_id"])
-        if (previous.get("status") == "needs_review" and previous.get("result") and
-                previous.get("policy_version") == POLICY_VERSION and
-                previous.get("description_sha256") == hashlib.sha256(job["description"].encode()).hexdigest()):
-            return finish("needs_review", "Evidence unchanged; retained prior assessment without another API call", previous["result"])
-        try:
-            result = score_job_with_claude(job)
-        except BudgetExceeded:
-            return finish("budget_deferred", "Daily API cap; queued for a later run")
-        if not result:
-            return finish("score_failed", "API or response validation failed; retry scheduled")
-        if result["disqualified"]:
-            return finish("rejected", result.get("disqualifier_reason") or "Profile exclusion", result)
-        if result.get("needs_review"):
-            return finish("needs_review", "Eligibility or role evidence is unverified or contradictory", result)
-        if result["score"] < CONFIG["min_score_for_card"]:
-            return finish("below_threshold", result.get("concerns", "Below score threshold"), result)
-
-    # Persist the score BEFORE the external write. A crash or failed request retries
-    # delivery after checking live Trello, rather than losing the job or duplicating it.
+    if job.get("link_needs_verification"):
+        result["flags"].append("Alert link did not expose a direct job URL; locate the role by employer and title")
     record_decision(seen, job, "delivery_failed", "Delivery pending", result)
     save_seen_jobs(seen)
     try:
         card = create_trello_card(watching_list_id, f"{job['company']} — {job['title']}",
-                                 build_scored_card_description(job, result))
+                                 build_first_pass_card_description(job, result))
     except Exception as exc:
         return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
     existing_cards.append({"company": job["company"], "title": job["title"], "url": job.get("url"),
                            "card_id": card["id"], "list_name": "Watching", "closed": False})
-    return finish("created", "Verified and delivered", result, card["id"])
+    return finish("created", "First-pass lead delivered for Claude deep vetting", result, card["id"])
+
+
+def title_is_plausible(job):
+    return any(contains_term(job.get("title", ""), term) for term in TITLE_ALLOWLIST)
+
+
+def build_first_pass_card_description(job, result):
+    flags = "\n".join(f"- {flag}" for flag in result["flags"]) or "- Verify full JD and employer site in the Claude project."
+    return f"""**Stage:** First-pass lead — awaiting Claude deep vet
+**Company:** {job['company']}
+**Source:** {job.get('source', 'Not specified')}
+**URL:** {job.get('url', 'Not provided')}
+**Found:** {datetime.now().strftime('%Y-%m-%d')}
+
+**Listed location:** {job.get('location') or 'Not specified'}
+**Remote:** {result['checks'].get('remote', 'Needs verification')}
+**Listed pay:** {job.get('salary') or 'Not listed'}
+**Employment type:** {job.get('employment_type') or 'Not specified'}
+**Metadata source:** {job.get('metadata_source', 'Job-board listing')}
+
+**Needs verification:**
+{flags}
+
+**Next step:** Use the Claude project to check the full job description, employer website,
+actual remote/geographic eligibility, responsibilities, compensation, and overall fit.
+This card passed a basic metadata screen; it has not received a full suitability score."""
 
 # ─────────────────────────────────────────────
 # PRE-FILTER
@@ -452,9 +463,9 @@ def process_job(job, seen, existing_cards, watching_list_id):
 # never a fit — skip Claude entirely
 TITLE_BLOCKLIST = [
     "sales", "account executive", "account manager", "business development",
-    "revenue", "customer success", "renewals", "marketing", "recruiter",
+    "revenue", "customer success", "client success", "gtm", "go-to-market", "commercial lending", "renewals", "marketing", "recruiter",
     "recruiting", "talent acquisition", "finance", "accounting", "payroll",
-    "human resources", "hr manager", "hr director",
+    "human resources", "hr manager", "hr director", "people operations",
     "legal counsel", "attorney", "lawyer", "nurse", "physician", "clinical",
     "ux designer", "graphic designer", "data scientist",
     "data engineer", "machine learning engineer", "software engineer",
@@ -476,7 +487,8 @@ TITLE_ALLOWLIST = [
     "infrastructure", "network", "sysadmin", "system admin", "helpdesk",
     "help desk", "service desk", "workplace", "internal tools", "devops",
     "release", "delivery", "integration", "enterprise", "business systems",
-    "it manager", "it director", "it lead", "data operations",
+    "it manager", "it director", "it lead", "data operations", "salesforce",
+    "program director", "program coordinator", "project coordinator", "project lead", "program lead",
     # Expanded title variations (June 2026)
     "solutions architect", "program designer", "learning experience",
     "knowledge manager", "systems and tools", "head of operations",
@@ -1272,13 +1284,8 @@ def crawl_remote_impact():
                     continue
                 seen_urls.add(href)
 
-                # Don't just trust the site's own "remote jobs" branding —
-                # read the card's actual location text if present. Only
-                # fall back to "Remote" (this site's default assumption)
-                # when no location element is found at all. This is what
-                # would have caught the dcbel listing (Montreal, Canada)
-                # that got labeled "Remote" purely because of the source.
-                location = location_el.get_text(strip=True) if location_el else "Remote"
+                # Branding alone does not establish remote eligibility.
+                location = location_el.get_text(strip=True) if location_el else "Not specified"
 
                 jobs.append({
                     "company":     company,
@@ -2148,6 +2155,11 @@ def run_gmail_scan():
         if idealist_cards:
             log.info(f"  {idealist_cards} new Idealist card(s) added to Watching")
 
+        if CONFIG["enable_wellfound_alerts"]:
+            run_metadata_alerts(service, "Wellfound", seen, existing_cards, watching_list_id)
+            if not _COLLECT_JOBS:
+                save_seen_jobs(seen)
+
         if CONFIG["enable_linkedin_alerts"]:
             linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
             if not _COLLECT_JOBS:
@@ -2434,123 +2446,122 @@ Return ONLY a JSON array of objects with string title, company, url fields."""
 
 
 def run_gmail_scan_idealist(service, seen, list_map, watching_list_id, existing_cards):
-    """
-    Scans Gmail for Idealist job alert emails, extracts job listings,
-    scores them with Claude, and creates Trello cards for strong matches.
+    return run_metadata_alerts(service, "Idealist", seen, existing_cards, watching_list_id)
 
-    Idealist sends daily digest emails with subject lines like:
-    "New jobs matching your search: technology manager"
 
-    Each email contains job titles, organizations, and links.
-    We parse those out and run them through the same scoring pipeline
-    as the regular crawlers.
-    """
-    log.info("Scanning Gmail for Idealist job alerts...")
-
-    # Search for Idealist alert emails in the last N days
-    lookback = CONFIG["gmail_lookback_days"]
-    query = f'from:(idealist.org) subject:(jobs matching) newer_than:{lookback}d'
-    emails = search_gmail(service, query, max_results=20)
-
-    if not emails:
-        # Try alternate subject patterns
-        query = f'from:(idealist.org) newer_than:{lookback}d'
-        emails = search_gmail(service, query, max_results=20)
-
-    pending = [dict(id="pending:" + key, subject=value.get("subject", ""), snippet="",
-                    saved_section=value.get("section"), saved_body=value.get("body"))
-               for key, value in alert_cache().items() if value.get("status") == "pending" and (value.get("section") or value.get("body"))]
-    emails = emails + pending
-
-    if not emails:
-        log.info("  No Idealist alert emails found in Gmail.")
-        log.info("  Make sure you have saved searches with email alerts on idealist.org")
-        return 0
-
-    RUN_REPORT["sources"]["Idealist email"] = {"emails": len(emails)}
-    log.info(f"  Found {len(emails)} Idealist alert email(s)")
-
-    client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"], max_retries=0, timeout=60)
-    cards_created = 0
-
-    for email in emails:
-        # Fetch the full email body — Idealist digests bundle multiple
-        # saved-search sections into one email, so a much higher cap than
-        # the default is used here (see IDEALIST_EMAIL_MAX_CHARS)
-        body = email.get("saved_body")
-        if body is None and not email.get("saved_section"):
-            body = get_email_body(service, email['id'], max_length=IDEALIST_EMAIL_MAX_CHARS)
-        content_for_claude = body if body else email['snippet']
-
-        sections = [email["saved_section"]] if email.get("saved_section") else split_into_search_sections(content_for_claude)
-
-        if not sections:
-            linked_count = sum(len(batch["urls"]) for batch in idealist_batches(content_for_claude))
-            if linked_count:
-                sections = [{"search_name": email['subject'], "raw_text": content_for_claude,
-                             "stated_count": linked_count}]
-        listings = []
-        if sections:
-            log.info(f"  Digest split into {len(sections)} saved-search section(s)")
-            for section in sections:
-                listings.extend(extract_idealist_section_listings(client, email['subject'], section,
-                    on_batch=collect_idealist_batch if _COLLECT_JOBS else None))
+def resolve_wellfound_job_link(job):
+    """Follow only a job-card redirect, never subscription or profile links."""
+    from urllib.parse import urlsplit
+    if job.get("link_checked") or urlsplit(job["url"]).hostname != "links.wellfound.com":
+        return job
+    job["link_checked"] = True
+    try:
+        response = requests.get(job["url"], allow_redirects=False, timeout=10)
+        target = response.headers.get("Location", "")
+        parts = urlsplit(target)
+        if parts.hostname in {"wellfound.com", "www.wellfound.com"} and re.match(r"/jobs/\d+-", parts.path):
+            job["url"] = "https://wellfound.com" + parts.path
         else:
-            # Small unrecognized emails retain the legacy cache key. Large inputs
-            # stay queued for inspection instead of another timeout-prone call.
-            log.info("  Digest did not match expected section format — using whole-body fallback extraction")
-            prompt = f"""Extract job listings from this Idealist job alert email.
+            job["link_needs_verification"] = True
+    except requests.RequestException:
+        job["link_needs_verification"] = True
+    return job
 
-Subject: {email['subject']}
-Content: {content_for_claude}
 
-Return ONLY a JSON array of job objects. If no clear jobs found, return [].
-Each object should have:
-{{"title": "job title", "company": "organization name", "url": "job URL if visible or empty string"}}
-
-Example: [{{"title": "IT Manager", "company": "ACLU", "url": "https://www.idealist.org/en/..."}}]
-
-Return only the JSON array, no other text."""
-
+def run_metadata_alerts(service, source, seen, existing_cards, watching_list_id):
+    """Parse known email card markup without sending newsletters or JDs to Claude."""
+    lookback = CONFIG["gmail_lookback_days"]
+    query = (f'from:(idealist.org) newer_than:{lookback}d' if source == "Idealist" else
+             f'from:(wellfound.com OR angel.co) subject:("New job" OR "New jobs") newer_than:{lookback}d')
+    emails = search_gmail(service, query, max_results=30)
+    current_keys = {f"metadata-v1:{source}:{email['id']}" for email in emails}
+    emails += [{"id": "pending:" + key, "cache_key": key, "saved_html": value["html"]}
+               for key, value in list(alert_cache().items())
+               if value.get("status") == "pending" and value.get("alert_source") == source
+               and value.get("html") and key not in current_keys]
+    parser = parse_idealist_html if source == "Idealist" else parse_wellfound_html
+    RUN_REPORT["sources"][source + " email"] = {"emails": len(emails), "listings": 0}
+    collected = {}
+    created = 0
+    for email in emails:
+        key = email.get("cache_key") or f"metadata-v1:{source}:{email['id']}"
+        cached = alert_cache().get(key, {})
+        if "listings" in cached:
+            jobs = cached["listings"]
+        else:
             try:
-                extraction_key = hashlib.sha256(prompt.encode()).hexdigest()
-                cached = alert_cache().get(extraction_key)
-                if cached and "listings" in cached:
-                    listings = cached["listings"]
+                html = email.get("saved_html")
+                if html is None:
+                    message = service.users().messages().get(userId="me", id=email["id"], format="full").execute()
+                    html = email_html(message.get("payload", {}))
+                if not html:
+                    queue_extraction(key, alert_source=source, message_id=email["id"],
+                                     payload=message.get("payload", {}))
+                    RUN_REPORT["warnings"].append(f"{source}: no HTML job cards; original input retained for review")
+                    continue
+                jobs, complete = parser(html)
+                if not jobs and not re.search(r"new (?:results?|jobs)", BeautifulSoup(html, "html.parser").get_text(" ", strip=True), re.I):
+                    store_extraction(key, [])  # unrelated newsletter, not a lost job alert
+                    continue
+                if complete:
+                    store_extraction(key, jobs)
                 else:
-                    queue_extraction(extraction_key, body=content_for_claude, subject=email['subject'])
-                    if extraction_key in _EXTRACTION_ATTEMPTS:
-                        continue
-                    _EXTRACTION_ATTEMPTS.add(extraction_key)
-                    if len(content_for_claude) > 6000:
-                        RUN_REPORT["warnings"].append("Idealist unrecognized large email: queued for format review")
-                        continue
-                    message = budgeted_message(client,
-                        model="claude-sonnet-4-6", max_tokens=1200,
-                        messages=[{"role": "user", "content": prompt}])
-                    listings = safe_parse_json_list(message.content[0].text.strip())
-                    if message.stop_reason != "max_tokens" and (listings or message.content[0].text.strip() == "[]"):
-                        store_extraction(extraction_key, listings)
-            except BudgetExceeded:
+                    queue_extraction(key, html=html, alert_source=source)
+                    RUN_REPORT["warnings"].append(f"{source}: email format incomplete; input retained for review")
+            except Exception as exc:
+                RUN_REPORT["warnings"].append(f"{source}: email read failed ({type(exc).__name__})")
                 continue
-            except Exception as e:
-                log.warning(f"  Could not parse Idealist email: {e}")
-                RUN_REPORT["warnings"].append("Idealist whole-email extraction failed")
-                continue
+        for job in jobs:
+            if source == "Wellfound" and pre_filter({**job, "description": ""})[0] and title_is_plausible(job):
+                # Cached redirect is reused across runs; no attempt to bypass blocked descriptions.
+                resolve_wellfound_job_link(job)
+            collected[posting_key(job)] = job
+            created += process_job(dict(job), seen, existing_cards, watching_list_id) == "created"
+        if jobs and "listings" in alert_cache().get(key, {}):
+            store_extraction(key, jobs)
+        if _COLLECT_JOBS:
+            flush_job_queue(fresh_only=True)
+    RUN_REPORT["sources"][source + " email"]["listings"] = len(collected)
+    if source == "Idealist":
+        recover_legacy_alerts(collected, seen, existing_cards, watching_list_id)
+    return created
 
-        if not listings:
+
+def recover_legacy_alerts(collected, seen, existing_cards, watching_list_id):
+    """Drain legacy digest input using saved metadata or bounded, free JSON-LD reads."""
+    fetched = 0
+    for key, value in list(alert_cache().items()):
+        section = value.get("section")
+        if value.get("status") != "pending" or not section:
             continue
+        urls = [url for batch in idealist_batches(section["raw_text"]) for url in batch["urls"]]
+        recovered = []
+        for url in dict.fromkeys(urls):
+            identity = posting_key({"url": url})
+            entry = seen.get(identity, {})
+            metadata_key = "listing-metadata:" + identity
+            candidate = collected.get(identity) or alert_cache().get(metadata_key, {}).get("job")
+            if candidate is None and known_company(entry.get("company")) and entry.get("title"):
+                candidate = {"location": entry.get("location") or "Not specified",
+                             "salary": entry.get("salary") or (entry.get("result", {}).get("salary_evidence") if entry.get("result", {}).get("salary_source") == "confirmed" else None) or "Not listed",
+                             **entry.get("job", {}), "url": url, "company": entry["company"],
+                             "title": entry["title"], "source": "Idealist (Gmail alert)"}
+            if candidate is None and fetched < CONFIG["max_legacy_metadata_per_run"]:
+                fetched += 1
+                response = safe_get(url, timeout=15)
+                metadata = extract_listing_metadata(response.text) if response is not None else {}
+                if metadata.get("title") and known_company(metadata.get("company")):
+                    candidate = {**metadata, "url": url, "source": "Idealist (Gmail alert)"}
+                    alert_cache()[metadata_key] = {"job": candidate, "date": utcnow().isoformat()}
+                    atomic_json(CONFIG["alert_extractions_file"], alert_cache())
+            if candidate:
+                collected[identity] = candidate
+                recovered.append(candidate)
+                process_job(dict(candidate), seen, existing_cards, watching_list_id)
+        if urls and len(recovered) == len(set(urls)) and len(urls) == section["stated_count"]:
+            store_extraction(key, recovered)
+    # New email leads were collected first; old unresolved inputs remain durable.
 
-        log.info(f"  Extracted {len(listings)} listing(s) from alert email")
-
-        for listing in listings:
-            job = idealist_job(listing)
-            if job["title"]:
-                outcome = process_job(job, seen, existing_cards, watching_list_id)
-                cards_created += outcome == "created"
-
-    log.info(f"  Idealist Gmail scan complete. {cards_created} card(s) created.")
-    return cards_created
 
 
 def run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards):
@@ -2841,8 +2852,6 @@ def main():
     _COLLECT_JOBS = False
     # Fresh candidates get the first scoring opportunities; historical rechecks go last.
     flush_job_queue(first_scores_only=True)
-    for client, subject, section in _DEFERRED_EXTRACTIONS.values():
-        extract_idealist_section_listings(client, subject, section, on_batch=collect_idealist_batch)
     flush_job_queue()
 
 
