@@ -156,7 +156,9 @@ class ReliabilityTests(unittest.TestCase):
         with patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'process_job') as process:
             agent.flush_job_queue(fresh_only=True)
             first = [call.args[0]['url'] for call in process.call_args_list]
-            self.assertEqual(first, [fresh['url'], deferred['url']])
+            self.assertEqual(first, [fresh['url']])
+            agent.flush_job_queue(first_scores_only=True)
+            self.assertEqual(process.call_args_list[-1].args[0]['url'], deferred['url'])
             self.assertIn(q.posting_key(old), agent._JOB_QUEUE)
             agent.flush_job_queue()
             self.assertEqual(process.call_args_list[-1].args[0]['url'], old['url'])
@@ -191,6 +193,66 @@ class ReliabilityTests(unittest.TestCase):
         with patch('sys.argv', ['agent']), patch.object(agent, 'run_job_crawl', side_effect=crawl), patch.object(agent, 'run_gmail_scan', side_effect=lambda: agent.collect_idealist_batch([mail])), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'enrich_job_description', side_effect=lambda candidate: {**job(), **candidate, 'description_verified': True}), patch.object(agent, 'score_job_with_claude', side_effect=scorer):
             agent.main()
         self.assertEqual(order, [fresh['url'], mail['url'], old['url']])
+
+    def test_irrelevant_titles_skip_fetch_and_paid_scoring(self):
+        for title in ['Camp Director', 'Summer Camp Director', 'Assistant Camp Director',
+                      'Camp Program Director', 'Director of Summer Camps', 'Chief Legal Officer',
+                      'Senior Legal Officer', 'General Counsel']:
+            candidate = job(title=title, url='https://example.org/jobs/' + title.replace(' ', '-'))
+            with self.subTest(title=title), patch.object(agent, 'enrich_job_description') as fetch, patch.object(agent, 'score_job_with_claude') as api:
+                self.assertEqual(agent.process_job(candidate, {}, [], 'w'), 'filtered')
+                fetch.assert_not_called(); api.assert_not_called()
+
+    def test_technical_work_in_camps_and_legal_organizations_still_eligible(self):
+        for title in ['IT Director', 'Legal Operations Manager', 'Legal Technology Manager',
+                      'Camp Technology Director', 'Program Operations Manager', 'Campus IT Director',
+                      'IT Manager, Office of General Counsel']:
+            with self.subTest(title=title):
+                self.assertTrue(agent.pre_filter(job(title=title, company='Summer Camp Legal Foundation'))[0])
+
+    def test_budget_deferrals_do_not_wait_24_hours(self):
+        seen = {}; candidate = job()
+        q.record_decision(seen, candidate, 'budget_deferred', 'Cap reached')
+        self.assertTrue(q.should_process(seen, candidate))
+        q.record_decision(seen, candidate, 'score_failed', 'API failed')
+        self.assertFalse(q.should_process(seen, candidate))
+
+    def test_new_ambiguous_role_precedes_older_plausible_budget_deferral(self):
+        fresh = job(title='Team Lead', url='https://example.org/jobs/new')
+        old = job(title='IT Manager'); seen = {}
+        q.record_decision(seen, old, 'budget_deferred', 'Cap reached')
+        self.assertLess(agent.candidate_priority(fresh, seen), agent.candidate_priority(old, seen))
+
+    def test_budget_deferrals_do_not_use_historical_retry_quota(self):
+        seen = {}; jobs = [job(url=f'https://example.org/jobs/{i}') for i in range(3)]
+        for candidate in jobs:
+            q.record_decision(seen, candidate, 'budget_deferred', 'Cap reached')
+        agent.save_seen_jobs(seen)
+        agent._JOB_QUEUE = {q.posting_key(j): j for j in jobs}
+        with patch.dict(agent.CONFIG, max_retry_jobs_per_run=1), patch.object(agent, 'get_trello_lists', return_value={'Watching': 'w'}), patch.object(agent, 'get_cards_for_duplicate_check', return_value=[]), patch.object(agent, 'process_job') as process:
+            agent.flush_job_queue(first_scores_only=True)
+            self.assertEqual(process.call_count, 3)
+
+    def test_explicit_office_requirement_skips_paid_scoring(self):
+        for requirement in ['This role is hybrid.', 'This position is fully on-site.',
+                            'Employees must work in the office three days per week.',
+                            'This job is not remote.']:
+            candidate = job(description='Manage internal SaaS systems. ' * 15 + requirement)
+            agent._PROCESSED_THIS_RUN.clear()
+            with self.subTest(requirement=requirement), patch.object(agent, 'enrich_job_description', return_value=candidate), patch.object(agent, 'score_job_with_claude') as api:
+                self.assertEqual(agent.process_job(candidate, {}, [], 'w'), 'filtered')
+                api.assert_not_called()
+
+    def test_ambiguous_remote_wording_and_optional_travel_are_not_cheap_rejections(self):
+        for text in ['Manage hybrid cloud infrastructure.', 'Hybrid or remote work available.',
+                     'This role is hybrid or fully remote.', 'This role is not hybrid.',
+                     'You must be on-site for the annual retreat.',
+                     'In-office attendance three days per week is not required.',
+                     'This role is hybrid. A fully remote option is also available.',
+                     'You must visit the office once per quarter.']:
+            with self.subTest(text=text):
+                self.assertIsNone(q.explicit_office_requirement(job(description=text)))
+        self.assertIsNone(q.explicit_office_requirement(job(description='This role is hybrid.', description_verified=False)))
 
 
 if __name__ == '__main__':

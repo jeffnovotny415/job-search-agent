@@ -42,7 +42,7 @@ from job_quality import (
     POLICY_VERSION, RETRY_STATES, atomic_json, canonical_url,
     contains_term, extract_posting, find_duplicate, known_company,
     posting_key, record_decision, should_process, sufficient_description,
-    validate_score, utcnow, navigation_url, idealist_batches,
+    validate_score, utcnow, navigation_url, idealist_batches, explicit_office_requirement,
 )
 
 # ─────────────────────────────────────────────
@@ -122,7 +122,7 @@ CONFIG = {
     "log_file": os.getenv("JOB_AGENT_LOG_FILE", "job_agent.log"),
     "max_description_chars": 30000,
     "max_retry_jobs_per_run": 8,
-    "daily_api_budget_usd": 0.50,
+    "daily_api_budget_usd": 0.75,
     "api_usage_file": "api_usage.json",
     "alert_extractions_file": "alert_extractions.json",
     "run_report_file": "run_report.json",
@@ -270,14 +270,16 @@ def run_status(report):
 
 def candidate_priority(job, seen):
     previous = seen.get(posting_key(job), {})
-    # A budget deferral has never received a score, so it still gets a first look.
-    history = (previous.get("status") in RETRY_STATES - {"budget_deferred", "delivery_failed"}
-               and not navigation_url(job.get("url")))
+    status = previous.get("status")
+    # New roles first, then never-scored budget deferrals, then older rechecks.
+    tier = 1 if status == "budget_deferred" else 2 if status in RETRY_STATES - {"delivery_failed"} else 0
+    if navigation_url(job.get("url")) or not pre_filter(job)[0]:
+        tier = 0  # free cleanup should not wait behind paid work
     plausible = any(contains_term(job.get("title", ""), term) for term in TITLE_ALLOWLIST)
-    return (history, not plausible, previous.get("retry_after", ""))
+    return (tier, not plausible, previous.get("retry_after", ""))
 
 
-def flush_job_queue(fresh_only=False):
+def flush_job_queue(fresh_only=False, first_scores_only=False):
     global _COLLECT_JOBS
     if not _JOB_QUEUE:
         return
@@ -289,9 +291,10 @@ def flush_job_queue(fresh_only=False):
         if not should_process(seen, job) or key in _PROCESSED_THIS_RUN:
             _JOB_QUEUE.pop(key, None)
             continue
-        if candidate_priority(job, seen)[0]:
-            if fresh_only:
-                continue
+        tier = candidate_priority(job, seen)[0]
+        if (fresh_only and tier > 0) or (first_scores_only and tier > 1):
+            continue
+        if tier == 2:
             if historical >= CONFIG["max_retry_jobs_per_run"]:
                 continue  # already durable in seen_jobs; retry date remains due
             historical += 1
@@ -392,6 +395,9 @@ def process_job(job, seen, existing_cards, watching_list_id):
             return finish("description_unavailable", job.get("description_error", "No verified description"))
         if job.get("expired"):
             return finish("expired", "Posting is closed or past its stated expiry")
+        office_requirement = explicit_office_requirement(job)
+        if office_requirement:
+            return finish("filtered", "Explicit office requirement: " + office_requirement)
         if not known_company(job.get("company")):
             return finish("needs_review", "Employer could not be verified")
         if len(job.get("description", "")) > CONFIG["max_description_chars"]:
@@ -515,6 +521,9 @@ BLOCKED_TITLE_PATTERNS = [
     r"\bjanitor\b", r"\bcustodian\b", r"\bsecurity guard\b",
     r"\bfarm ?(hand|worker)\b", r"\bagro\b", r"\bfield (officer|associate|worker|agent)\b",
     r"\bdairy\b", r"\bconstruction\b", r"\bwelder\b", r"\bnurse\b",
+    r"\bcamp\s+(?:(?:program|site|executive|assistant|co)[ -]+)?director\b",
+    r"\bdirector\s+(?:of\s+)?(?:(?:summer|day|overnight)\s+)?camps?\b",
+    r"^(?:(?:chief|senior|assistant|deputy|associate)\s+)*(?:legal\s+officer|(?:general|corporate)\s+counsel)\b",
 ]
 _BLOCKED_TITLE_RE = re.compile("|".join(BLOCKED_TITLE_PATTERNS), re.IGNORECASE)
 
@@ -614,7 +623,7 @@ def pre_filter(job):
     2. Pass if title matches an allowlist term
     3. If title is ambiguous, check description for disqualifiers
     4. Default to sending to Claude when uncertain — better to
-       spend $0.003 than miss a good role
+       evaluate an ambiguous role than miss a good match
     """
     title = job.get("title", "").lower()
     description = job.get("description", "").lower()
@@ -2831,7 +2840,7 @@ def main():
 
     _COLLECT_JOBS = False
     # Fresh candidates get the first scoring opportunities; historical rechecks go last.
-    flush_job_queue(fresh_only=True)
+    flush_job_queue(first_scores_only=True)
     for client, subject, section in _DEFERRED_EXTRACTIONS.values():
         extract_idealist_section_listings(client, subject, section, on_batch=collect_idealist_batch)
     flush_job_queue()

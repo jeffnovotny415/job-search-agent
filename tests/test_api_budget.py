@@ -51,3 +51,15 @@ class BudgetTests(unittest.TestCase):
         self.budget.path.write_text(json.dumps({'day':'2020-01-01','usd':10}))
         self.budget.create(self.client,**self.kwargs)
         self.assertLess(self.budget.load()['usd'],.50)
+
+    def test_increasing_cap_preserves_today_spending(self):
+        ledger = self.budget.load(); ledger['usd'] = .49185255
+        self.budget.path.write_text(json.dumps(ledger))
+        increased = DailyBudget(self.budget.path, .75)
+        increased.create(self.client, **self.kwargs)
+        self.assertAlmostEqual(increased.load()['usd'], .49185255 + .0045)
+        ledger = increased.load(); ledger['usd'] = .749
+        self.budget.path.write_text(json.dumps(ledger))
+        with self.assertRaises(BudgetExceeded):
+            increased.create(self.client, **self.kwargs)
+        self.assertEqual(self.client.messages.create.call_count, 1)

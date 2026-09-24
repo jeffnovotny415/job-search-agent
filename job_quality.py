@@ -164,6 +164,9 @@ def should_process(seen, job, now=None):
         return True
     if entry.get("status") not in RETRY_STATES:
         return False
+    # A deferral is governed by the daily spending ledger, not a rolling 24h delay.
+    if entry.get("status") == "budget_deferred":
+        return True
     retry = parse_date(entry.get("retry_after"))
     return retry is None or (now or utcnow()) >= retry
 
@@ -274,6 +277,38 @@ def extract_posting(html, job, final_url):
 
 
 ELIGIBILITY_CRITERIA = ("remote", "travel", "schedule", "work", "credentials")
+
+
+def explicit_office_requirement(job):
+    """Return narrow evidence from a verified JD, never a bare 'hybrid' mention.
+
+    Remote alternatives or contradictory wording go to the evidence scorer.
+    Addresses, hybrid infrastructure, and occasional travel are not exclusions.
+    """
+    if not job.get("description_verified"):
+        return None
+    text = job.get("description", "")
+    if re.search(r"\b(?:fully remote|100% remote|remote[- ]first|remote (?:option|work is available)|"
+                 r"(?:can|may) work remotely)\b", text, re.I):
+        return None
+    for sentence in re.split(r"[.!?\n]+", text):
+        sentence = sentence.strip()
+        if re.search(r"\b(?:optional|occasionally|quarterly|annually|annual|retreat|visit|"
+                     r"no longer|not required|not mandatory)\b", sentence, re.I):
+            continue
+        # 'Hybrid or remote' is not an office mandate.
+        if re.search(r"\bremote(?:ly)?\b", sentence, re.I):
+            if re.fullmatch(r"(?:this|the) (?:role|position|job) is not (?:a )?remote(?: role| position| job)?", sentence, re.I):
+                return sentence
+            continue
+        if re.search(r"\b(?:this|the) (?:role|position|job) (?:is|will be) (?:an? )?"
+                     r"(?:(?:fully|strictly|exclusively) )?(?:hybrid|on[- ]?site|in[- ]person)\b", sentence, re.I):
+            return sentence
+        if (re.search(r"\b(?:must|required)\b", sentence, re.I)
+                and re.search(r"\b(?:in[- ]office|in (?:the|our) office|on[- ]?site)\b", sentence, re.I)
+                and re.search(r"\b(?:[1-5]|one|two|three|four|five) days? (?:per|a|each|every) week\b", sentence, re.I)):
+            return sentence
+    return None
 
 
 def validate_score(result, job):

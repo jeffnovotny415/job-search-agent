@@ -20,7 +20,7 @@ class DailyBudget:
     CACHE_WRITE = 3.75 / 1_000_000
     CACHE_READ = .30 / 1_000_000
 
-    def __init__(self, path, limit=.50):
+    def __init__(self, path, limit=.75):
         self.path = Path(path)
         self.limit = limit
 
