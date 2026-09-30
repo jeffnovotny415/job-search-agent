@@ -42,14 +42,14 @@ class MetadataTests(unittest.TestCase):
         for location in ['Remote only, Canada','Anywhere in India (Remote)','Remote — UK only']:
             with self.subTest(location=location):
                 self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
-        self.assertEqual(screen_metadata(job(location='Remote, United States or Canada'))['decision'],'pass')
+        self.assertEqual(screen_metadata(job(location='Remote, United States or Canada'))['decision'],'skip')
         location=json.dumps({'jobLocationType':'TELECOMMUTE','applicantLocationRequirements':{'name':'Canada'}})
         self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
         location=json.dumps({'jobLocationType':'TELECOMMUTE','jobLocation':{'address':{'addressCountry':'Canada'}}})
-        self.assertEqual(screen_metadata(job(location=location))['decision'],'pass')
+        self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
 
     def test_unknown_currency_and_unbounded_pay_do_not_false_reject(self):
-        for pay in ['EUR 80000/year','CAD $85000/year','At least USD $80000/year']:
+        for pay in ['80000/year','At least USD $80000/year']:
             result=screen_metadata(job(salary=pay))
             self.assertEqual(result['decision'],'pass');self.assertTrue(result['flags'])
 

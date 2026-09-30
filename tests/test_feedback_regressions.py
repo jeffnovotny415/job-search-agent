@@ -48,14 +48,14 @@ class FeedbackRules(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(jobs[0]['employment_type'],'contract')
 
-    def test_foreign_job_location_vs_remote_employer_headquarters(self):
+    def test_foreign_job_location_is_excluded_even_with_remote_label(self):
         for country in ['IN', {'name':'India'}]:
             location={'jobLocation':{'address':{'addressCountry':country}}}
             self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
             location['jobLocationType']='TELECOMMUTE'
-            self.assertEqual(screen_metadata(job(location=location))['decision'],'pass')
+            self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
         location={'jobLocation':[{'address':{'addressCountry':'CA'}},{'address':{'addressCountry':'US'}}]}
-        self.assertEqual(screen_metadata(job(location=location))['decision'],'pass')
+        self.assertEqual(screen_metadata(job(location=location))['decision'],'skip')
 
     def test_metadata_absence_is_not_proof_of_office_work(self):
         location={'jobLocation':{'address':{'addressCountry':'US','addressLocality':'Boston'}}}

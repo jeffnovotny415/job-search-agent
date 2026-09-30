@@ -38,6 +38,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import base64
 from api_budget import DailyBudget, BudgetExceeded
+from geographic_filters import state_eligibility
 from first_pass import (screen_metadata, email_html, parse_idealist_html, parse_wellfound_html,
                         extract_listing_metadata, idealist_url, structured_value,
                         display_location, display_pay, explicit_description_exclusions)
@@ -90,6 +91,7 @@ CONFIG = {
     # First-stage metadata screen; deep vetting happens in the separate Claude project.
     "annual_salary_floor": 90000,
     "contract_hourly_floor": 65,
+    "home_state": "NJ",
     "enable_wellfound_alerts": True,
     "max_legacy_metadata_per_run": 20,
 
@@ -405,6 +407,13 @@ def process_job(job, seen, existing_cards, watching_list_id):
     result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
     if result["decision"] == "skip":
         return finish("filtered", result["reason"], result)
+    state_reason, state_flag = state_eligibility(
+        job.get("description", "") if job.get("description_verified") else "",
+        job.get("location", ""), CONFIG["home_state"])
+    if state_reason:
+        return finish("filtered", state_reason, result)
+    if state_flag:
+        result["flags"].append(state_flag)
     if job.get("description_verified"):
         exclusions = explicit_description_exclusions(job.get("description", ""), job.get("location", ""))
         if exclusions:
@@ -523,6 +532,8 @@ This card passed a basic metadata screen; it has not received a full suitability
 # Titles containing these words are almost
 # never a fit — skip Claude entirely
 TITLE_BLOCKLIST = [
+    "power systems engineer", "commercial operations", "pricing", "compliance manager",
+    "asia", "india", "emea", "latam",
     "sales", "account executive", "account manager", "business development",
     "revenue", "customer success", "client success", "gtm", "go-to-market", "commercial lending", "renewals", "marketing", "recruiter",
     "recruiting", "talent acquisition", "finance", "accounting", "payroll",

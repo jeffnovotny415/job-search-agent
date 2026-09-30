@@ -14,7 +14,9 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 **Free first-pass screening**
 - Title must indicate IT, technical project/program work, AI workflow, or adjacent operations.
 - Clear mismatches such as camp directors, legal officers, sales, and HR are skipped.
-- Explicit hybrid/on-site listings and clear remote-country restrictions outside the US are skipped. A city by itself does not establish an office requirement.
+- Explicit hybrid/on-site listings are skipped. Any named non-US country in job-location/eligibility metadata, or explicit non-USD pay, is now excluded even if a remote label is present. Unknown currency/location remains flagged. US state abbreviations are not treated as country codes in free text.
+- Power Systems Engineer, Commercial Operations, Pricing, and Compliance Manager titles are excluded, as are titles containing Asia, India, EMEA, or LATAM (whole words).
+- Fetched, verified posting text and structured state eligibility are checked against **New Jersey (NJ)**. Explicit eligible-state lists omitting NJ, or exclusions naming NJ, are skipped. Partial lists and unparseable restrictions are flagged; office locations alone do not establish eligibility.
 - Skip annual salary ranges whose maximum is below **$90,000**, except explicitly part-time roles.
 - Contract/hourly listings must reach **$65/hour**; explicitly part-time employee roles retain the salary exception.
 - Missing salary, unclear remote eligibility, geographic restrictions, or ambiguous pay units are flagged for the Claude project instead of silently discarded.
@@ -68,9 +70,7 @@ Watching → Applied → Interview → Offer → Closed
 git clone https://github.com/yourusername/job-search-agent.git
 cd job-search-agent
 
-pip3 install requests beautifulsoup4 google-auth google-auth-oauthlib \
-             google-auth-httplib2 google-api-python-client anthropic \
-             python-dotenv lxml
+pip3 install -r requirements.txt
 ```
 
 ### 2. Configure credentials
@@ -133,7 +133,7 @@ python3 jeff_job_agent.py --gmail
 
 Production runs in a separate private GitHub runner repository, keeping personal state and logs private. A Claude routine triggers its `workflow_dispatch` each morning. GitHub's `schedule` trigger is disabled. A concurrency guard prevents overlapping runs.
 
-Deploy these together: `jeff_job_agent.py`, `first_pass.py`, `job_quality.py`, `api_budget.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
+Deploy these together: `jeff_job_agent.py`, `first_pass.py`, `geographic_filters.py`, `job_quality.py`, `api_budget.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
 
 
 ---
@@ -156,6 +156,7 @@ The API spending ceiling remains **$0.75/day**, resetting at midnight America/Ne
 |---|---|---|
 | `annual_salary_floor` | 90000 | Reject full-time salary ranges entirely below this floor |
 | `contract_hourly_floor` | 65 | Minimum viable contract/hourly rate |
+| `home_state` | NJ | Required state eligibility for explicitly restricted remote jobs |
 | `enable_wellfound_alerts` | true | Read existing Wellfound emails |
 | `gmail_lookback_days` | 7 | Recent discovery/status emails |
 | `daily_api_budget_usd` | 0.75 | Cap remaining model-assisted status tracking |
@@ -173,6 +174,7 @@ The Claude daily trigger is unchanged. Wellfound alerts observed at 9:25 AM East
 ```
 jeff_job_agent.py    # Crawlers, Gmail/Trello orchestration
 first_pass.py        # Free metadata screening and HTML email parsers
+geographic_filters.py # Country/currency rules and explicit state eligibility
 job_quality.py      # Job identity, duplicate detection, retry policy
 api_budget.py       # Persistent daily API spending guard
 tests/              # Offline regression tests

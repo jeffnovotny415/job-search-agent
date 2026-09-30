@@ -6,6 +6,7 @@ import re
 from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
+from geographic_filters import foreign_currency, foreign_location
 
 
 def clean(value):
@@ -212,32 +213,16 @@ def screen_metadata(job, annual_floor=90000, contract_floor=65):
     checks['remote'] = 'Listed as remote' if remote and not office else 'Needs verification'
     if checks['remote'] == 'Needs verification':
         flags.append('Verify fully remote eligibility; listing is missing or conflicting')
-    # Only explicit country restrictions disqualify. A city alone does not prove on-site work.
-    foreign_only = re.search(r'(?:remote\s*(?:only)?\s*[•,–—:-]?\s*|anywhere in\s+)(canada|united kingdom|uk|india|australia|germany|europe)(?:\s*\(remote\))?(?:\s+only)?$', lower)
-    try:
-        structured_location = json.loads(location)
-    except (ValueError, TypeError):
-        structured_location = {}
-    if isinstance(structured_location, dict):
-        restrictions = structured_location.get('applicantLocationRequirements', [])
-        if isinstance(restrictions, dict):
-            restrictions = [restrictions]
-        names = {clean(item.get('name')).lower() for item in restrictions if isinstance(item, dict)}
-        foreign_countries = {'canada', 'united kingdom', 'uk', 'india', 'australia', 'germany', 'france', 'europe'}
-        foreign_only = foreign_only or bool(names and names.issubset(foreign_countries))
-        places = structured_location.get('jobLocation') or []
-        places = places if isinstance(places, list) else [places]
-        countries = {country_name(place) for place in places} - {''}
-        # A foreign job location with no remote signal is incompatible. A foreign
-        # employer's HQ with explicit remote eligibility is not a disqualifier.
-        if countries and not countries & {'US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA'} and not remote:
-            return {'stage': 'first-pass', 'decision': 'skip', 'reason': 'Structured job location is outside the US with no remote eligibility', 'flags': [], 'checks': checks}
-    if foreign_only:
-        return {'stage': 'first-pass', 'decision': 'skip', 'reason': 'Listing restricts remote work outside the US', 'flags': [], 'checks': checks}
+    country = foreign_location(job.get('location'))
+    if country:
+        return {'stage': 'first-pass', 'decision': 'skip', 'reason': f'Listing includes a non-US country: {country}', 'flags': [], 'checks': checks}
     checks['location'] = location or 'Not specified'
     if not re.search(r'\bunited states\b|\bu\.?s\.?a?\b|\bworldwide\b|\beverywhere\b', lower):
         flags.append('Verify geographic eligibility for a northeastern US applicant')
     pay = json.dumps(job['salary']) if isinstance(job.get('salary'), dict) else clean(job.get('salary')) or 'Not listed'
+    currency = foreign_currency(pay)
+    if currency:
+        return {'stage': 'first-pass', 'decision': 'skip', 'reason': f'Listed compensation is not USD: {currency}', 'flags': [], 'checks': checks}
     upper, period, currency, bounded = posted_pay(pay)
     employment = clean(job.get('employment_type')) + ' ' + job.get('title', '')
     part_time = bool(re.search(r'part[- _]?time', employment, re.I))
