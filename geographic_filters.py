@@ -55,12 +55,24 @@ def foreign_currency(value):
     return None
 
 
+def _country_in_text(text):
+    for match in COUNTRY_PATTERN.finditer(text):
+        if match[0].lower() in {'jersey', 'mexico'} and re.search(r'\bnew\s+$', text[:match.start()], re.I):
+            continue
+        if match[0].lower() == 'jersey' and re.match(r'\s+city\b', text[match.end():], re.I):
+            continue
+        # A country name can also be a US town, e.g. Lebanon, PA.
+        if re.match(r',\s*(?:' + '|'.join(sorted(STATE_CODES)) + r')\b', text[match.end():]):
+            continue
+        return match[0]
+    return None
+
+
 def foreign_location(value):
     """Job location/applicant eligibility only; never scan employer names or JD prose."""
     obj = object_value(value)
     if not obj:
-        match = COUNTRY_PATTERN.search(str(value or ''))
-        return match[0] if match else None
+        return _country_in_text(str(value or ''))
     for place in values(obj.get('jobLocation')):
         address = place.get('address', {}) if isinstance(place, dict) else {}
         if isinstance(address, dict):
@@ -72,13 +84,13 @@ def foreign_location(value):
                 return country
             # Some boards put the whole address in addressLocality and omit country.
             if not country:
-                match = COUNTRY_PATTERN.search(' '.join(str(address.get(k) or '') for k in ('addressLocality', 'addressRegion')))
-                if match:
-                    return match[0]
+                country = _country_in_text(', '.join(str(address.get(k) or '') for k in ('addressLocality', 'addressRegion')))
+                if country:
+                    return country
         elif isinstance(address, str):
-            match = COUNTRY_PATTERN.search(address)
-            if match:
-                return match[0]
+            country = _country_in_text(address)
+            if country:
+                return country
     for restriction in values(obj.get('applicantLocationRequirements')):
         if not isinstance(restriction, dict):
             continue
@@ -87,9 +99,9 @@ def foreign_location(value):
             continue
         if restriction.get('@type') == 'Country' and name.upper() not in US_NAMES | UNKNOWN | {'EARTH', 'WORLDWIDE', 'GLOBAL'}:
             return name
-        match = COUNTRY_PATTERN.search(name)
-        if match:
-            return match[0]
+        country = _country_in_text(name)
+        if country:
+            return country
     return foreign_location(obj.get('listingLocation', ''))
 
 

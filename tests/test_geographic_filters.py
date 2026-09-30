@@ -30,9 +30,14 @@ class GeographicRules(unittest.TestCase):
 
     def test_us_states_are_not_interpreted_as_country_codes(self):
         for location in ['Remote US', 'Atlanta, GA', 'Georgia, United States', 'Portland, ME', 'Indianapolis, IN',
+                         'Remote, New Jersey', 'New Mexico, US', 'Jersey City, NJ', 'Lebanon, PA',
                          {'jobLocation':{'address':{'addressCountry':'USA','addressRegion':'CA'}}},
                          {'applicantLocationRequirements':{'@type':'State','name':'CA'}}]:
             self.assertIsNone(foreign_location(location),location)
+
+    def test_foreign_country_still_rejects_alongside_similarly_named_us_state(self):
+        for location in ['New Mexico or Mexico', 'New Jersey or Jersey']:
+            self.assertIsNotNone(foreign_location(location),location)
 
     def test_non_usd_pay_is_rejected_even_without_an_amount(self):
         for pay in ['INR 1800000–2400000/year', '€90k', '£110000/year', 'C$100k', '₹2400000',
