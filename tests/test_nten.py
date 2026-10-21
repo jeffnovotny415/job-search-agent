@@ -153,7 +153,7 @@ class NtenDeliveryTests(unittest.TestCase):
 
     def process(self,candidate):
         agent._PROCESSED_THIS_RUN.clear()
-        return agent.process_job(candidate,self.seen,self.cards,'watching')
+        return agent.process_job(candidate,self.seen,self.cards,{'Roles':'watching','Projects':'projects'})
 
     def test_rfp_creates_named_labeled_card_with_no_ai_or_extra_fetch(self):
         with patch.object(agent,'create_trello_card',return_value={'id':'card'}) as create,patch.object(agent,'budgeted_message') as ai,patch.object(agent,'safe_get') as fetch:

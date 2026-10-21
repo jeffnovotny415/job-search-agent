@@ -39,6 +39,9 @@ from googleapiclient.discovery import build
 import base64
 from api_budget import DailyBudget, BudgetExceeded
 import nten_source
+import engagement
+import additional_sources
+import community_alerts
 from geographic_filters import state_eligibility
 from first_pass import (screen_metadata, email_html, parse_idealist_html, parse_wellfound_html,
                         extract_listing_metadata, idealist_url, structured_value,
@@ -74,7 +77,8 @@ CONFIG = {
 
     # Trello list names — must match exactly what's on your board
     "trello_lists": {
-        "watching":    "Watching",
+        "watching":    engagement.ROLES,
+        "projects":    engagement.PROJECTS,
         "applied":     "Applied",
         "reach":       "Reach",
         "interview":   "Interview",
@@ -95,6 +99,8 @@ CONFIG = {
     "home_state": "NJ",
     "enable_wellfound_alerts": True,
     "enable_nten": True,
+    "enable_additional_sources": True,
+    "enable_community_alerts": True,
     "nten_opportunity_types": ["Employment", "Contract", "RFP"],
     "max_legacy_metadata_per_run": 20,
 
@@ -313,7 +319,7 @@ def flush_job_queue(fresh_only=False, first_scores_only=False):
     if not candidates:
         return  # cached batches do not require another Trello board read
     list_map = get_trello_lists()
-    watching = list_map.get(CONFIG["trello_lists"]["watching"])
+    watching = review_destinations(list_map)
     if not watching:
         raise RuntimeError("Watching list is missing")
     cards = get_cards_for_duplicate_check(list_map)
@@ -372,6 +378,7 @@ def write_run_report():
 
 def process_job(job, seen, existing_cards, watching_list_id):
     """One delivery/retry contract shared by crawlers and every email source."""
+    job["engagement_track"] = engagement.track(job)
     key = posting_key(job)
     if _COLLECT_JOBS:
         _JOB_QUEUE.setdefault(key, dict(job))
@@ -387,8 +394,11 @@ def process_job(job, seen, existing_cards, watching_list_id):
         save_seen_jobs(seen)
         return report_outcome(job, status, reason)
 
-    if job.get("source") == "NTEN":
-        return process_nten_job(job, seen, existing_cards, watching_list_id, finish)
+    if (job.get("source") == "NTEN" or job.get("source") in additional_sources.FEEDS
+            or job.get("source") in community_alerts.SOURCES or engagement.track(job) == "Projects"):
+        job.setdefault("opportunity_type", nten_source.opportunity_kind("", job.get("employment_type", "")))
+        job.setdefault("compensation_unit", nten_source.pay_unit(job.get("salary", "")))
+        return process_opportunity_job(job, seen, existing_cards, watching_list_id, finish)
 
     if navigation_url(job.get("url")):
         return finish("not_a_job", "Board navigation link; removed from retry queue")
@@ -406,6 +416,13 @@ def process_job(job, seen, existing_cards, watching_list_id):
     if result["decision"] == "skip":
         return finish("filtered", result["reason"], result)
     recover_first_pass_metadata(job)
+    job.pop("engagement_track", None)
+    job["engagement_track"] = engagement.track(job)
+    if engagement.track(job) == "Projects":
+        job["engagement_track"] = "Projects"
+        job.setdefault("opportunity_type", "Contract")
+        job.setdefault("compensation_unit", nten_source.pay_unit(job.get("salary", "")))
+        return process_opportunity_job(job, seen, existing_cards, watching_list_id, finish)
     if not known_company(job.get("company")):
         return finish("needs_review", "Employer name unavailable; no unnamed Trello card created")
     if not pre_filter({**job, "description": ""})[0] or not title_is_plausible(job):
@@ -436,32 +453,37 @@ def process_job(job, seen, existing_cards, watching_list_id):
     record_decision(seen, job, "delivery_failed", "Delivery pending", result)
     save_seen_jobs(seen)
     try:
-        card = create_trello_card(watching_list_id, f"{job['company']} — {job['title']}",
+        card = create_trello_card(review_destination(watching_list_id, job), f"{job['company']} — {job['title']}",
                                  build_first_pass_card_description(job, result))
     except Exception as exc:
         return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
     existing_cards.append({"company": job["company"], "title": job["title"], "url": job.get("url"),
-                           "card_id": card["id"], "list_name": "Watching", "closed": False})
+                           "card_id": card["id"], "list_name": engagement.PROJECTS if engagement.track(job) == "Projects" else engagement.ROLES, "closed": False})
     RUN_REPORT.setdefault("created_cards", []).append({"company": job["company"], "card_id": card["id"]})
     return finish("created", "First-pass lead delivered for Claude deep vetting", result, card["id"])
 
 
-def process_nten_job(job, seen, existing_cards, watching_list_id, finish):
+def process_opportunity_job(job, seen, existing_cards, watching_list_id, finish):
     """Keep client project rules separate from employment-title/pay heuristics."""
-    if job.get("opportunity_type") not in CONFIG["nten_opportunity_types"]:
+    if job.get("source") == "NTEN" and job.get("opportunity_type") not in CONFIG["nten_opportunity_types"]:
         return finish("filtered", "NTEN opportunity type disabled")
     if not known_company(job.get("company")):
-        return finish("needs_review", "NTEN employer unavailable; no unnamed card created")
+        return finish("needs_review", "Employer/client unavailable; no unnamed card created")
     result = nten_source.screen(job, CONFIG["annual_salary_floor"],
                                 CONFIG["contract_hourly_floor"], CONFIG["home_state"])
+    if additional_sources.expired(job):
+        result.update(decision="skip", reason="Explicit listing/proposal deadline has passed")
     # Retain explicit employer exclusions and unrelated-title exclusions while
     # allowing the web/app/database work requested for this source.
-    allowed, reason = pre_filter({**job, "description": ""})
     expanded = bool(nten_source.relevant_skills(job))
-    web_title_block = reason.startswith("title blocklist:") and any(
-        term in reason for term in ("software engineer", "software developer", "frontend", "backend", "fullstack", "full-stack", "full stack"))
-    if not allowed and not (expanded and web_title_block):
+    web_terms = {"software engineer", "software developer", "frontend engineer", "backend engineer",
+                 "fullstack", "full stack", "ux designer"} if expanded else set()
+    allowed, reason = pre_filter({**job, "description": ""}, allowed_title_terms=web_terms)
+    if not allowed:
         result.update(decision="skip", reason=reason)
+    elif (engagement.track(job) == "Roles" and title_is_plausible(job) and
+          result["reason"].startswith("No specific technical or nonprofit operations match")):
+        result.update(decision="pass", reason="Plausible employment title; needs Claude deep vet")
     match = find_duplicate(job, existing_cards, clean_company_name)
     previous = seen.get(posting_key(job), {})
     changed = bool(previous.get("source_fingerprint") and
@@ -474,36 +496,49 @@ def process_nten_job(job, seen, existing_cards, watching_list_id, finish):
                           "Already in pipeline", result, match["card_id"])
         # Changes are useful even when the new salary/location no longer passes.
         # Append a dated note without moving the card or overwriting user notes.
-        marker = "NTEN revision: " + job["source_fingerprint"]
+        source_name = job.get("source", "Source")
+        marker = source_name + " revision: " + job["source_fingerprint"]
         job["_update_existing"] = True
-        record_decision(seen, job, "delivery_failed", "NTEN update pending", result, match["card_id"])
+        record_decision(seen, job, "delivery_failed", "Listing update pending", result, match["card_id"])
         save_seen_jobs(seen)
         try:
             current = get_card_description(match["card_id"])
             if marker not in current:
-                note = (f"\n\n---\n**NTEN listing materially changed — {utcnow().date()}**\n"
+                note = (f"\n\n---\n**{source_name} listing materially changed — {utcnow().date()}**\n"
                         f"**Current screen:** {result['decision']} — {result['reason']}\n"
                         + build_first_pass_card_description(job, result) + "\n" + marker)
                 if len(current + note) > 16000:
                     raise ValueError("Card description full; update needs manual review")
                 update_card_description(match["card_id"], current + note)
         except Exception as exc:
-            return finish("delivery_failed", f"NTEN change note failed: {type(exc).__name__}; retry scheduled", result, match["card_id"])
-        return finish("updated", "Material NTEN change appended to existing card", result, match["card_id"])
+            return finish("delivery_failed", f"Listing change note failed: {type(exc).__name__}; retry scheduled", result, match["card_id"])
+        return finish("updated", "Material listing change appended to existing card", result, match["card_id"])
     if result["decision"] == "skip":
         return finish("filtered", result["reason"], result)
     record_decision(seen, job, "delivery_failed", "Delivery pending", result)
     save_seen_jobs(seen)
     try:
-        card = create_trello_card(watching_list_id,
+        card = create_trello_card(review_destination(watching_list_id, job),
                                  f"{job['company']} — [{job['opportunity_type']}] {job['title']}",
                                  build_first_pass_card_description(job, result))
     except Exception as exc:
         return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
     existing_cards.append({"company": job["company"], "title": job["title"], "url": job["url"],
-                           "card_id": card["id"], "list_name": "Watching", "closed": False})
+                           "card_id": card["id"], "list_name": engagement.PROJECTS if engagement.track(job) == "Projects" else engagement.ROLES, "closed": False})
     RUN_REPORT.setdefault("created_cards", []).append({"company": job["company"], "card_id": card["id"]})
-    return finish("created", "NTEN first-pass opportunity delivered for deep vetting", result, card["id"])
+    return finish("created", "First-pass opportunity delivered for deep vetting", result, card["id"])
+
+
+def crawl_additional_sources():
+    jobs, health = additional_sources.crawl(
+        alert_cache(), lambda: atomic_json(CONFIG["alert_extractions_file"], alert_cache()))
+    RUN_REPORT["sources"].update(health)
+    for source, state in health.items():
+        for warning in state.get("warnings", []) + ([state["warning"]] if state.get("warning") else []):
+            RUN_REPORT["warnings"].append(f"{source}: {warning}")
+    RUN_REPORT["sources"]["crawl_additional_sources"] = {
+        "collected": len(jobs), "healthy": all(state.get("healthy") for state in health.values())}
+    return jobs
 
 
 def crawl_nten():
@@ -576,8 +611,14 @@ def title_is_plausible(job):
 
 def build_first_pass_card_description(job, result):
     flags = "\n".join(f"- {flag}" for flag in result["flags"]) or "- Verify full JD and employer site in the Claude project."
-    extra = "\n\n" + nten_source.card_details(job, result) if job.get("source") == "NTEN" else ""
+    extra = "\n\n" + nten_source.card_details(job, result) if job.get("opportunity_type") else ""
+    next_step = ("Use the Claude project to check scope, client, remote delivery, budget versus effort, "
+                 "proposal deadline, references, vendor eligibility and linked documents/addenda."
+                 if engagement.track(job) == "Projects" else
+                 "Use the Claude project to check the full job description, employer website, "
+                 "remote/geographic eligibility, responsibilities, compensation and overall fit.")
     return f"""**Stage:** First-pass lead — awaiting Claude deep vet
+**Track:** {engagement.track(job)}
 **Company:** {job['company']}
 **Source:** {job.get('source', 'Not specified')}
 **URL:** {job.get('url', 'Not provided')}
@@ -592,8 +633,7 @@ def build_first_pass_card_description(job, result):
 **Needs verification:**
 {flags}
 
-**Next step:** Use the Claude project to check the full job description, employer website,
-actual remote/geographic eligibility, responsibilities, compensation, and overall fit.
+**Next step:** {next_step}
 This card passed a basic metadata screen; it has not received a full suitability score."""
 
 # ─────────────────────────────────────────────
@@ -772,7 +812,7 @@ def is_defense_contractor(employer_name):
     return bool(_DEFENSE_CONTRACTOR_RE.search(employer_name.lower()))
 
 
-def pre_filter(job):
+def pre_filter(job, allowed_title_terms=()):
     """
     Fast keyword pre-filter. Returns (should_score, reason).
     True = send to Claude. False = skip, save the API call.
@@ -820,7 +860,7 @@ def pre_filter(job):
 
     # Hard block on title — these are almost never a fit
     for term in TITLE_BLOCKLIST:
-        if contains_term(title, term):
+        if term not in allowed_title_terms and contains_term(title, term):
             return False, f"title blocklist: '{term}'"
 
     # Hard block on occupation mismatch — blue-collar/manual-labor/field
@@ -991,6 +1031,24 @@ def trello_params(extra=None):
         p.update(extra)
     return p
 
+def review_destinations(list_map):
+    """Legacy fallback allows a rolling deployment while the list is renamed."""
+    roles = list_map.get(engagement.ROLES) or list_map.get("Watching")
+    return {"Roles": roles, "Projects": list_map.get(engagement.PROJECTS)} if roles else None
+
+
+def review_destination(destinations, job):
+    if isinstance(destinations, str):
+        # Legacy direct callers may only route roles; never silently mix projects.
+        if engagement.track(job) == "Roles":
+            return destinations
+        raise ValueError("Projects review list was not supplied")
+    destination = (destinations or {}).get(engagement.track(job))
+    if not destination:
+        raise ValueError("Review list missing; preserve delivery for retry")
+    return destination
+
+
 def get_trello_lists():
     """Returns {list_name: list_id} for every list on the board."""
     url = f"{TRELLO_BASE}/boards/{CONFIG['trello_board_id']}/lists"
@@ -1010,8 +1068,8 @@ def get_all_active_cards(list_map):
     closed_names = [CONFIG["trello_lists"]["closed"], CONFIG["trello_lists"]["rejected"]]
     active = []
     for name, lid in list_map.items():
-        if name not in closed_names:
-            active.extend(get_trello_cards(lid))
+        if name not in closed_names and name != engagement.PROJECTS:
+            active.extend(card for card in get_trello_cards(lid) if not engagement.project_card(card, name))
     return active
 
 def create_trello_card(list_id, name, desc):
@@ -1104,6 +1162,8 @@ def get_all_board_cards(list_map):
     cards = []
     for list_name, list_id in list_map.items():
         for card in get_trello_cards(list_id):
+            if engagement.project_card(card, list_name):
+                continue
             company, title = parse_card_name(card.get("name", ""))
             if not company:
                 continue
@@ -2280,7 +2340,7 @@ def run_gmail_scan():
     # ── Idealist job alert emails ──
     # Parse any Idealist alert emails and create Trello cards for new matches
     seen = load_seen_jobs()
-    watching_list_id = list_map.get(CONFIG["trello_lists"]["watching"])
+    watching_list_id = review_destinations(list_map)
     if watching_list_id:
         # Fetched once and shared across all three alert sources below so a
         # repost that shows up in, say, both LinkedIn and Built In on the
@@ -2295,8 +2355,10 @@ def run_gmail_scan():
 
         if CONFIG["enable_wellfound_alerts"]:
             run_metadata_alerts(service, "Wellfound", seen, existing_cards, watching_list_id)
-            if not _COLLECT_JOBS:
-                save_seen_jobs(seen)
+        if CONFIG["enable_community_alerts"]:
+            run_community_alerts(service, seen, existing_cards, watching_list_id)
+        if not _COLLECT_JOBS:
+            save_seen_jobs(seen)
 
         if CONFIG["enable_linkedin_alerts"]:
             linkedin_cards = run_gmail_scan_linkedin(service, seen, list_map, watching_list_id, existing_cards)
@@ -2604,6 +2666,40 @@ def resolve_wellfound_job_link(job):
     except requests.RequestException:
         job["link_needs_verification"] = True
     return job
+
+
+def run_community_alerts(service, seen, existing_cards, destinations):
+    for source, (host, _) in community_alerts.SOURCES.items():
+        emails = search_gmail(service, f'from:({host}) newer_than:{CONFIG["gmail_lookback_days"]}d', max_results=30)
+        current = {"community-v1:" + source + ":" + mail["id"] for mail in emails}
+        emails += [{"id": "pending", "cache_key": key} for key, value in list(alert_cache().items())
+                   if value.get("status") == "pending" and value.get("alert_source") == source and key not in current]
+        state = {"emails": len(emails), "listings": 0, "status": "Awaiting notifications" if not emails else "Email intake"}
+        RUN_REPORT["sources"][source] = state
+        for mail in emails:
+            key = mail.get("cache_key") or "community-v1:" + source + ":" + mail["id"]
+            cached = alert_cache().get(key, {})
+            if "listings" in cached:
+                jobs = cached["listings"]
+            else:
+                try:
+                    payload = cached.get("payload")
+                    if payload is None:
+                        payload = service.users().messages().get(userId="me", id=mail["id"], format="full").execute().get("payload", {})
+                    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+                    html = email_html(payload)
+                    jobs, complete = community_alerts.parse_alert(html, source, headers.get("subject", ""), headers.get("date", "")) if html else ([], False)
+                    if complete:
+                        store_extraction(key, jobs)
+                    else:
+                        queue_extraction(key, alert_source=source, payload=payload)
+                        RUN_REPORT["warnings"].append(source + ": unrecognized alert retained; template verification needed")
+                except Exception as exc:
+                    RUN_REPORT["warnings"].append(source + ": alert read failed: " + type(exc).__name__)
+                    continue
+            for job in jobs:
+                state["listings"] += 1
+                process_job(dict(job), seen, existing_cards, destinations)
 
 
 def run_metadata_alerts(service, source, seen, existing_cards, watching_list_id):
@@ -2920,7 +3016,7 @@ def run_job_crawl():
     log.info("JOB CRAWL STARTING")
     seen = load_seen_jobs()
     list_map = get_trello_lists()
-    watching_list_id = list_map.get(CONFIG["trello_lists"]["watching"])
+    watching_list_id = review_destinations(list_map)
     if not watching_list_id:
         raise RuntimeError("Watching list is missing")
     existing_cards = get_cards_for_duplicate_check(list_map)
@@ -2931,12 +3027,14 @@ def run_job_crawl():
     crawlers = [crawl_remote_impact, crawl_tech_jobs_for_good, crawl_ffwd]
     if CONFIG["enable_nten"]:
         crawlers.append(crawl_nten)
+    if CONFIG["enable_additional_sources"]:
+        crawlers.append(crawl_additional_sources)
     for crawler in crawlers:
         name = crawler.__name__
         try:
             jobs = crawler()
             RUN_REPORT["sources"].setdefault(name, {"collected": len(jobs), "healthy": bool(jobs)})
-            if not jobs:
+            if not jobs and not RUN_REPORT["sources"][name].get("healthy"):
                 RUN_REPORT["warnings"].append(f"{name}: zero postings; source health needs checking")
             for job in sorted(jobs, key=lambda j: candidate_priority(j, seen)):
                 process_job(job, seen, existing_cards, watching_list_id)

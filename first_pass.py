@@ -329,7 +329,11 @@ def explicit_description_exclusions(text, location=''):
                         continue
                     return True
                 return False
-            office = (r'\bhybrid (?:work )?(?:schedule|role|position|arrangement)\b',
+            office = (r'\b(?:work from home|wfh)(?:\s*\(wfh\))? (?:option )?(?:is )?(?:available |allowed )?(?:only )?(?:one|two|three|four|[1-4]) days? (?:per|a) week\b',
+                      r'\bhybrid (?:work|working)\s*:?$',
+                      r'\brequire[sd]?\s+(?:regular\s+)?on[- ]?site presence\b',
+                      r'\b(?:will|must)\s+(?:regularly\s+)?work\b.{0,45}\bat (?:the|our) office\b',
+                      r'\bhybrid (?:work )?(?:schedule|role|position|arrangement)\b',
                       r'\b(?:fully |full[- ]time[, ]+)?on[- ]?site (?:role|position|work)\b',
                       r'\b(?:role|position) (?:is|will be) (?:fully )?on[- ]?site\b',
                       r'\b(?:must|required to|expected to) (?:work|be|come) (?:from |in |into |at )?(?:our |the )?office\b',

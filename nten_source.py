@@ -19,7 +19,8 @@ import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
-from first_pass import screen_metadata, explicit_description_exclusions
+from engagement import track
+from first_pass import screen_metadata, explicit_description_exclusions, display_location, structured_value
 from geographic_filters import state_eligibility
 
 INDEX = 'https://www.nten.org/jobs'
@@ -27,9 +28,9 @@ CACHE_KEY = 'source:nten:v1'
 USER_AGENT = 'JobDiscoveryBot/1.0 (+https://github.com/jeffnovotny415/job-search-agent)'
 MAX_BYTES = 8 * 1024 * 1024
 SKILLS = {
-    'Websites / web apps': r'\b(?:websites?|web (?:development|developer|design|apps?|applications?)|wordpress|drupal|front[- ]?end|full[- ]?stack|ecrm)\b',
-    'Integrations / systems': r'\b(?:integrations?|salesforce|crm|business systems|information (?:technology|systems)|IT (?:manager|director|support|operations)|systems (?:and data )?(?:manager|administrator|analyst))\b',
-    'Automation / internal tools': r'\b(?:automation|workflows?|internal tools?|business applications?|AI (?:engineer|operations)|artificial intelligence)\b',
+    'Websites / web apps': r'\b(?:websites?|web (?:development|developer|design|apps?|applications?)|wordpress|drupal|front[- ]?end|full[- ]?stack|ui/ux|ux/ui|webflow|woocommerce|ecrm)\b',
+    'Integrations / systems': r'\b(?:integrations?|salesforce|crm|managed service provider|business systems|information (?:technology|systems)|IT (?:manager|director|support|operations)|systems (?:and data )?(?:manager|administrator|analyst))\b',
+    'Automation / internal tools': r'\b(?:automation|workflows?|internal tools?|business applications?|airtable|n8n|make\.com|zapier|softr|webflow|AI (?:engineer|operations)|artificial intelligence)\b',
     'Databases': r'\b(?:databases?|data (?:architecture|engineer|engineering)|SQL)\b',
     'Nonprofit operations': r'\b(?:operations (?:manager|director)|director of operations|technical (?:project|program) manager)\b',
 }
@@ -53,11 +54,17 @@ def opportunity_kind(category, employment):
 
 
 def pay_unit(salary):
+    obj = structured_value(salary)
+    if obj:
+        value = obj.get('value', obj)
+        unit = str(value.get('unitText', '')).lower() if isinstance(value, dict) else ''
+        return {'hour': 'hour', 'hourly': 'hour', 'year': 'year', 'annual': 'year'}.get(unit, 'unknown')
+    salary = str(salary or '')
     if re.search(r'project[- ]based|total (?:project )?budget|fixed[- ](?:price|fee)', salary, re.I):
         return 'project'
     if re.search(r'hourly|/\s*(?:hr|hour)|per hour', salary, re.I):
         return 'hour'
-    if re.search(r'yearly|annual|/year', salary, re.I):
+    if re.search(r'yearly|annual|/\s*(?:year|yr)|per year', salary, re.I):
         return 'year'
     return 'unknown'
 
@@ -144,7 +151,7 @@ def proposal_evidence(text):
     """Keep source excerpts, not inferred dates or an invented compliance verdict."""
     lines = [clean(line) for line in text.splitlines() if clean(line)]
     patterns = {
-        'Deadlines / dates': r'proposal deadline|proposals?.{0,30}(?:due|accepted)|applications?.{0,30}due|submit.{0,60}\bby\b|no (?:new|additional) inquiries',
+        'Deadlines / dates': r'proposal (?:submission )?deadline|proposals?.{0,30}(?:due|accepted)|applications?.{0,30}due|submit.{0,60}\bby\b|no (?:new|additional) inquiries',
         'Proposal requirements': r'references?|submit|submission|proposal (?:must|should|requirements)|portfolio|bios?\b|itemized|cost proposal|insurance|eligibility|vendor qualifications',
     }
     evidence = {}
@@ -165,7 +172,7 @@ def proposal_evidence(text):
 
 def fingerprint(job):
     fields = ('title', 'company', 'salary', 'compensation_unit', 'location', 'location_info',
-              'employment_type', 'opportunity_type', 'job_function', 'description')
+              'employment_type', 'opportunity_type', 'job_function', 'description', 'engagement_track')
     material = {key: clean(job.get(key)) for key in fields}
     material['documents'] = sorted((doc['url'], hashlib.sha256(clean(doc.get('text')).encode()).hexdigest())
                                    for doc in job.get('documents', []))
@@ -177,7 +184,7 @@ def relevant_skills(job):
     # must not turn a Development Director into a software candidate.
     title = job.get('title', '')
     matches = [label for label, pattern in SKILLS.items() if re.search(pattern, title, re.I)]
-    if job.get('opportunity_type') in {'Contract', 'RFP'}:
+    if track(job) == 'Projects':
         text = job.get('description', '') + '\n' + '\n'.join(doc.get('text', '') for doc in job.get('documents', []))
         action = r'\b(?:build|design|redesign|develop|migrat|implement|integrat|automat|administ|configur|maintain|optimi|replac|creat|customiz|deploy|upgrad)\w*'
         for label, pattern in SKILLS.items():
@@ -193,6 +200,7 @@ def relevant_skills(job):
 
 def screen(job, annual_floor=90000, contract_floor=65, home_state='NJ'):
     project = job.get('compensation_unit') == 'project'
+    project_track = track(job) == 'Projects'
     candidate = dict(job)
     if project or job.get('compensation_unit') == 'unknown':
         # Preserve original money/currency, but never infer an annual period from its size.
@@ -201,7 +209,7 @@ def screen(job, annual_floor=90000, contract_floor=65, home_state='NJ'):
         candidate['salary'] = f'{currency} (period unknown)' if currency else 'Not listed'
     if job.get('opportunity_type') in {'Contract', 'RFP'}:
         candidate['employment_type'] = 'contract'
-    candidate['location'] = clean(job.get('location', '') + ' ' + job.get('location_info', ''))
+    candidate['location'] = clean(display_location(job.get('location')) + ' ' + str(job.get('location_info') or ''))
     result = screen_metadata(candidate, annual_floor, contract_floor)
     if re.search(r'\b(?:outside (?:the )?(?:US|USA|U\.S\.|United States)|non[- ]US)\b', candidate['location'], re.I):
         result.update(decision='skip', reason='Listing explicitly located outside the US')
@@ -214,7 +222,9 @@ def screen(job, annual_floor=90000, contract_floor=65, home_state='NJ'):
         result['flags'] = [flag for flag in result['flags'] if flag != 'Verify pay, currency, and pay period']
         result['flags'].append('Total project budget: assess scope, delivery effort, and margin; not an annual salary or an hourly offer')
     text = job.get('description', '') + '\n' + '\n'.join(doc.get('text', '') for doc in job.get('documents', []))
-    reason, flag = state_eligibility(text, candidate['location'], home_state)
+    # For projects a client's office state is not a vendor residence restriction.
+    # Explicit must-reside/vendor eligibility in source text still applies.
+    reason, flag = state_eligibility(text, '' if project_track else job.get('location', ''), home_state)
     exclusions = explicit_description_exclusions(text, candidate['location'])
     if job.get('opportunity_type') != 'Employment':
         exclusions = [item for item in exclusions if item != 'Role owns customer accounts/renewals']
@@ -222,8 +232,11 @@ def screen(job, annual_floor=90000, contract_floor=65, home_state='NJ'):
         result.update(decision='skip', reason=reason or '; '.join(exclusions))
     if flag:
         result['flags'].append(flag)
+    if re.search(r'\b(?:unpaid|volunteer only|equity[- ]only|revenue[- ]share only)\b', job.get('title', '') + ' ' + str(job.get('salary', '')), re.I):
+        result.update(decision='skip', reason='Unpaid/equity/revenue-share-only opportunity')
     result['flags'].extend(job.get('source_flags', []))
-    if job.get('opportunity_type') in {'RFP', 'Contract'}:
+    if project_track:
+        result['flags'].append('Verify remote delivery and vendor/service-area eligibility; client address does not establish an employee residence requirement')
         result['flags'].append('Verify proposal deadline/time zone, references, eligibility, scope and all linked documents/addenda before pursuing')
     return result
 

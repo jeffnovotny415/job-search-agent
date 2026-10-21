@@ -9,6 +9,11 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 - [Tech Jobs for Good](https://techjobsforgood.com)
 - [FFWD Jobs](https://jobs.ffwd.org)
 - [NTEN](https://www.nten.org/jobs): employment, contracts, and RFPs for Ravensbreath Lab
+- [WordPress Jobs](https://jobs.wordpress.net/feed/): official RSS plus employer/type/budget fields from each posting
+- [We Work Remotely](https://weworkremotely.com/remote-job-rss-feed): official RSS, restricted to design, product, frontend, full-stack and sysadmin categories; each card attributes and links the source
+- [Recidiviz](https://www.recidiviz.org/careers): initial direct-employer watchlist entry, using its official public Greenhouse board
+- [Achievement First procurement](https://www.achievementfirst.org/category/partnerships/) and [National Trust RFPs](https://savingplaces.org/requests-for-proposals): small direct procurement watchlist
+- Make Hire Help, Airtable Jobs Board and n8n Jobs: **email notifications only**, pending subscriptions and validation against real account alerts
 - Idealist and Wellfound saved-search/recommendation emails in Gmail
 - LinkedIn and Built In integrations remain disabled
 
@@ -27,12 +32,12 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 - Repeated US location suffixes are ignored in company/title duplicate checks; seniority and specialty distinctions remain. Multiple new cards at one employer receive a comparison flag at the end of the run.
 
 **Trello handoff**
-Cards in Watching say **First-pass lead — awaiting Claude deep vet**. They include employer, source link, listed location/pay, and specific facts to verify. They do not claim to be fully vetted, assign a suitability score, or invent salary recommendations or remote eligibility.
+Cards in **Watching — Roles** and **Watching — Projects** say **First-pass lead — awaiting Claude deep vet**. They include employer, source link, listed location/pay, and specific facts to verify. They do not claim to be fully vetted, assign a suitability score, or invent salary recommendations or remote eligibility.
 
 **NTEN employment and client projects**
-NTEN shares the Watching feed, with `[Employment]`, `[Contract]`, or `[RFP]` in each card title. Website/web-app, integration, automation, internal-tool, database, and nonprofit-operations signals are screened locally; bare “development” is not a software signal. Employment relevance uses the title to avoid treating incidental CRM/website mentions in fundraising jobs as technical work. Project descriptions and attached PDF text can supply concrete scope signals.
+One tool uses two review queues. **Roles** includes salaried, part-time and contract staff positions. **Projects** includes scoped client builds, fixed-price work and RFPs. A contract label alone does not make something a project. NTEN and the added sources retain `[Employment]`, `[Contract]`, or `[RFP]` in each card title. Website/web-app, integration, automation, internal-tool, database, and nonprofit-operations signals are screened locally; bare “development” is not a software signal. Employment relevance uses the title to avoid treating incidental CRM/website mentions in fundraising jobs as technical work. Project descriptions and attached PDF text can supply concrete scope signals.
 
-Annual employment uses the existing salary floor and part-time exception; hourly contracts use the existing $65 floor. Explicit **project budgets remain total project budgets**, and unknown periods remain unknown. Neither is converted into a salary or an invented hourly rate. Project scope, effort, pricing, references, and suitability remain for the separate deep vet.
+Both tracks use free, deterministic screening; the separate Claude project retains the deep vet. Annual employment uses the existing salary floor and part-time exception; hourly contracts use the existing $65 floor. Explicit **project budgets remain total project budgets**, and unknown periods remain unknown. Neither is converted into a salary or an invented hourly rate. Project scope, effort, pricing, references, and suitability remain for the separate deep vet.
 
 NTEN is checked at most once per Eastern calendar day, including failed attempts. Reruns reuse the snapshot stored in the existing private `alert_extractions.json`. Public pages and linked PDFs are fetched without AI, subject to each host's robots rules, crawl delay/request rate, a minimum one-second interval, and rate-limit deferral. Crawl failures appear in the run report instead of masquerading as zero matches.
 
@@ -40,8 +45,25 @@ Cards preserve posting dates, pay units, location notes, deadline/submission/ref
 
 Material changes to title, employer, location, compensation, opportunity type, scope text, or document text/links are detected using a fingerprint. Changed active cards receive a dated note (even if the new terms fail screening), without moving them or overwriting user notes. Unchanged listings are skipped, failed updates retry, and archived passes are never reopened. Excerpts are bounded; if an existing card has no room for an update, it stays in the retry/review queue. Posting timestamp/whitespace-only changes do not create updates.
 
+**Added-source limits and health**
+Each public adapter is attempted once per Eastern calendar day, with independent health reporting and private cached snapshots. Empty valid feeds count as successful checks; blocked/malformed sources are reported as failures. The same robots-aware, bounded HTTP client is used throughout. We Work Remotely's state field is preserved as a verification flag rather than assumed to be an applicant restriction. Explicit location/remote requirements in posting text still apply. No direct crawling of Make, Airtable or n8n is performed.
+
+The procurement watchlist checks current public indexes and captures proposal deadlines, references, submission excerpts and document links. Explicitly expired proposal dates are skipped; ambiguous dates remain flagged. Public PDF links use the same bounded extraction as NTEN; form-gated documents remain manual links, with no form submissions. This is a focused watchlist, not coverage of every government or nonprofit RFP. NJSTART, RFPDB and other account-based procurement sources are not enabled.
+
+**Subscription setup (user action)**
+Use the Gmail account already connected to this agent, sign in, and enable category emails for new topics/posts only, with replies disabled where supported:
+
+- [Make — Hire Help](https://community.make.com/c/hire-a-pro/hire-help/74): category notification control; choose “Watching First Post” if offered and ensure email notifications are enabled in account preferences.
+- [Airtable — Jobs Board](https://community.airtable.com/jobs-board-16): subscribe to the category and select first/new posts only where available.
+- [n8n — Jobs](https://community.n8n.io/c/jobs/13): category notification control; choose “Watching First Post” if offered and ensure email delivery is enabled.
+
+Exact notification menus depend on the account/site version. No passwords or API keys are needed by the agent for these sources. Once a real alert arrives, verify the template. The initial parser accepts single hiring-topic notifications with explicit company/client fields; replies and “for hire” ads are excluded. Unknown templates/digests retain original input in the private retry cache; missing client identity stays in review and never creates an unnamed card. Until real alerts have been checked, these integrations are provisional, not verified end-to-end.
+
+**Claude deep-vet project update (paste into project instructions)**
+> Read both `Watching — Roles` and `Watching — Projects`. Treat the crawler's metadata as preliminary evidence. For Roles, check the full JD, real employer, fully remote eligibility from New Jersey, responsibilities, and compensation ($90k annual floor except part-time employment; $65/hour contract floor). For Projects, assess Ravensbreath Lab's fit for websites/apps, integrations, automation, internal tools and databases; verify the actual client, remote delivery, scope, total budget versus effort, proposal deadline/time zone, references, vendor qualifications, submission requirements and every linked RFP/addendum. Keep annual salary, hourly rates and total project budgets distinct. Contract staff positions stay in Roles. Do not reopen archived passes. Project proposals and client follow-up are manual; job-email automation only manages Roles.
+
 **Gmail pipeline tracking**
-Scans the inbox daily for emails from active pipeline companies. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also reads job alert emails to extract basic listing metadata.
+Scans the inbox daily for emails from active role pipeline companies. Project cards are excluded from both application-status scanning and reconciliation, including when moved to another list. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also reads job alert emails to extract basic listing metadata.
 
 **Pre-filtering**
 A cheap keyword pre-filter runs before any Claude API calls, skipping obvious mismatches (sales titles, engineering roles, etc.) without spending API tokens. Saves roughly 30-40% of API costs on a typical run.
@@ -56,9 +78,10 @@ Existing company/title cache records are migrated lazily without deletion. Faile
 ## Pipeline stages
 
 ```
-Watching → Applied → Interview → Offer → Closed
+Watching — Roles → Applied → Interview → Offer → Closed
                   ↘ Rejected
                   ↘ Reach (long shots)
+Watching — Projects → manual proposal/client follow-up
 ```
 
 ---
@@ -171,6 +194,8 @@ The API spending ceiling remains **$0.75/day**, resetting at midnight America/Ne
 | `home_state` | NJ | Required state eligibility for explicitly restricted remote jobs |
 | `enable_wellfound_alerts` | true | Read existing Wellfound emails |
 | `enable_nten` | true | Daily NTEN source, with no model calls |
+| `enable_additional_sources` | true | Official feeds, Recidiviz and focused procurement watchlist |
+| `enable_community_alerts` | true | Email-only intake, pending real notification validation |
 | `nten_opportunity_types` | Employment, Contract, RFP | Optional type filter within the same feed |
 | `gmail_lookback_days` | 7 | Recent discovery/status emails |
 | `daily_api_budget_usd` | 0.75 | Cap remaining model-assisted status tracking |
@@ -189,6 +214,9 @@ The Claude daily trigger is unchanged. Wellfound alerts observed at 9:25 AM East
 jeff_job_agent.py    # Crawlers, Gmail/Trello orchestration
 first_pass.py        # Free metadata screening and HTML email parsers
 nten_source.py       # Daily NTEN crawl, project units, PDF evidence and change detection
+engagement.py        # Role/project classification and queue names
+additional_sources.py # Daily public feeds, ATS and procurement watchlists
+community_alerts.py  # Email-only hiring topic parsing; no forum requests
 geographic_filters.py # Country/currency rules and explicit state eligibility
 job_quality.py      # Job identity, duplicate detection, retry policy
 api_budget.py       # Persistent daily API spending guard

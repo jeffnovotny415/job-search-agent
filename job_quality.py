@@ -171,7 +171,7 @@ def should_process(seen, job, now=None):
     entry = cache_entry(seen, job)
     if not entry:
         return True
-    if (job.get("source") == "NTEN" and job.get("source_fingerprint") and
+    if (job.get("source_fingerprint") and
             entry.get("source_fingerprint") != job["source_fingerprint"]):
         return True
     if (entry.get("policy_version") != POLICY_VERSION and
@@ -198,6 +198,7 @@ def record_decision(seen, job, status, reason, result=None, card_id=None):
         "policy_version": POLICY_VERSION, "attempts": attempts,
         "location": job.get("location"), "salary": job.get("salary"),
         "employment_type": job.get("employment_type"),
+        "engagement_track": job.get("engagement_track"),
         "description_source": job.get("description_source"),
         "description_sha256": hashlib.sha256(job.get("description", "").encode()).hexdigest(),
     }
@@ -216,7 +217,7 @@ def record_decision(seen, job, status, reason, result=None, card_id=None):
         entry["retry_after"] = (now + timedelta(days=days)).isoformat()
         # Persist enough input to retry even when a digest falls outside lookback.
         entry["job"] = {k: v for k, v in job.items() if k != "description"}
-        if status == "delivery_failed":
+        if status == "delivery_failed" or job.get("source_fingerprint"):
             entry["job"]["description"] = job.get("description", "")
     seen[key] = entry
     return entry
