@@ -38,6 +38,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import base64
 from api_budget import DailyBudget, BudgetExceeded
+import nten_source
 from geographic_filters import state_eligibility
 from first_pass import (screen_metadata, email_html, parse_idealist_html, parse_wellfound_html,
                         extract_listing_metadata, idealist_url, structured_value,
@@ -93,6 +94,8 @@ CONFIG = {
     "contract_hourly_floor": 65,
     "home_state": "NJ",
     "enable_wellfound_alerts": True,
+    "enable_nten": True,
+    "nten_opportunity_types": ["Employment", "Contract", "RFP"],
     "max_legacy_metadata_per_run": 20,
 
     # Alert-email sources to scan for job listings. Idealist stays on;
@@ -384,6 +387,9 @@ def process_job(job, seen, existing_cards, watching_list_id):
         save_seen_jobs(seen)
         return report_outcome(job, status, reason)
 
+    if job.get("source") == "NTEN":
+        return process_nten_job(job, seen, existing_cards, watching_list_id, finish)
+
     if navigation_url(job.get("url")):
         return finish("not_a_job", "Board navigation link; removed from retry queue")
     match = find_duplicate(job, existing_cards, clean_company_name)
@@ -438,6 +444,75 @@ def process_job(job, seen, existing_cards, watching_list_id):
                            "card_id": card["id"], "list_name": "Watching", "closed": False})
     RUN_REPORT.setdefault("created_cards", []).append({"company": job["company"], "card_id": card["id"]})
     return finish("created", "First-pass lead delivered for Claude deep vetting", result, card["id"])
+
+
+def process_nten_job(job, seen, existing_cards, watching_list_id, finish):
+    """Keep client project rules separate from employment-title/pay heuristics."""
+    if job.get("opportunity_type") not in CONFIG["nten_opportunity_types"]:
+        return finish("filtered", "NTEN opportunity type disabled")
+    if not known_company(job.get("company")):
+        return finish("needs_review", "NTEN employer unavailable; no unnamed card created")
+    result = nten_source.screen(job, CONFIG["annual_salary_floor"],
+                                CONFIG["contract_hourly_floor"], CONFIG["home_state"])
+    # Retain explicit employer exclusions and unrelated-title exclusions while
+    # allowing the web/app/database work requested for this source.
+    allowed, reason = pre_filter({**job, "description": ""})
+    expanded = bool(nten_source.relevant_skills(job))
+    web_title_block = reason.startswith("title blocklist:") and any(
+        term in reason for term in ("software engineer", "software developer", "frontend", "backend", "fullstack", "full-stack", "full stack"))
+    if not allowed and not (expanded and web_title_block):
+        result.update(decision="skip", reason=reason)
+    match = find_duplicate(job, existing_cards, clean_company_name)
+    previous = seen.get(posting_key(job), {})
+    changed = bool(previous.get("source_fingerprint") and
+                   previous["source_fingerprint"] != job.get("source_fingerprint"))
+    if match:
+        exact = canonical_url(match.get("url")) == canonical_url(job.get("url"))
+        pending_update = previous.get("status") == "delivery_failed" and previous.get("job", {}).get("_update_existing")
+        if match.get("closed") or not exact or not (changed or pending_update or job.get("_update_existing")):
+            return finish("duplicate", "Previously passed on" if match.get("closed") else
+                          "Already in pipeline", result, match["card_id"])
+        # Changes are useful even when the new salary/location no longer passes.
+        # Append a dated note without moving the card or overwriting user notes.
+        marker = "NTEN revision: " + job["source_fingerprint"]
+        job["_update_existing"] = True
+        record_decision(seen, job, "delivery_failed", "NTEN update pending", result, match["card_id"])
+        save_seen_jobs(seen)
+        try:
+            current = get_card_description(match["card_id"])
+            if marker not in current:
+                note = (f"\n\n---\n**NTEN listing materially changed — {utcnow().date()}**\n"
+                        f"**Current screen:** {result['decision']} — {result['reason']}\n"
+                        + build_first_pass_card_description(job, result) + "\n" + marker)
+                if len(current + note) > 16000:
+                    raise ValueError("Card description full; update needs manual review")
+                update_card_description(match["card_id"], current + note)
+        except Exception as exc:
+            return finish("delivery_failed", f"NTEN change note failed: {type(exc).__name__}; retry scheduled", result, match["card_id"])
+        return finish("updated", "Material NTEN change appended to existing card", result, match["card_id"])
+    if result["decision"] == "skip":
+        return finish("filtered", result["reason"], result)
+    record_decision(seen, job, "delivery_failed", "Delivery pending", result)
+    save_seen_jobs(seen)
+    try:
+        card = create_trello_card(watching_list_id,
+                                 f"{job['company']} — [{job['opportunity_type']}] {job['title']}",
+                                 build_first_pass_card_description(job, result))
+    except Exception as exc:
+        return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
+    existing_cards.append({"company": job["company"], "title": job["title"], "url": job["url"],
+                           "card_id": card["id"], "list_name": "Watching", "closed": False})
+    RUN_REPORT.setdefault("created_cards", []).append({"company": job["company"], "card_id": card["id"]})
+    return finish("created", "NTEN first-pass opportunity delivered for deep vetting", result, card["id"])
+
+
+def crawl_nten():
+    jobs, warnings, cached = nten_source.crawl(
+        alert_cache(), lambda: atomic_json(CONFIG["alert_extractions_file"], alert_cache()))
+    RUN_REPORT["warnings"].extend(warnings)
+    RUN_REPORT["sources"]["crawl_nten"] = {
+        "collected": len(jobs), "healthy": bool(jobs) and not warnings, "daily_cache": cached}
+    return jobs
 
 
 def recover_first_pass_metadata(job):
@@ -501,6 +576,7 @@ def title_is_plausible(job):
 
 def build_first_pass_card_description(job, result):
     flags = "\n".join(f"- {flag}" for flag in result["flags"]) or "- Verify full JD and employer site in the Claude project."
+    extra = "\n\n" + nten_source.card_details(job, result) if job.get("source") == "NTEN" else ""
     return f"""**Stage:** First-pass lead — awaiting Claude deep vet
 **Company:** {job['company']}
 **Source:** {job.get('source', 'Not specified')}
@@ -511,7 +587,7 @@ def build_first_pass_card_description(job, result):
 **Remote:** {result['checks'].get('remote', 'Needs verification')}
 **Listed pay:** {display_pay(job.get('salary'))}
 **Employment type:** {job.get('employment_type') or 'Not specified'}
-**Metadata source:** {job.get('metadata_source', 'Job-board listing')}
+**Metadata source:** {job.get('metadata_source', 'Job-board listing')}{extra}
 
 **Needs verification:**
 {flags}
@@ -2852,11 +2928,14 @@ def run_job_crawl():
                   if v.get("status") in RETRY_STATES and v.get("job")
                   and should_process(seen, v["job"])]
     retry_jobs.sort(key=lambda j: seen[posting_key(j)].get("retry_after", ""))
-    for crawler in (crawl_remote_impact, crawl_tech_jobs_for_good, crawl_ffwd):
+    crawlers = [crawl_remote_impact, crawl_tech_jobs_for_good, crawl_ffwd]
+    if CONFIG["enable_nten"]:
+        crawlers.append(crawl_nten)
+    for crawler in crawlers:
         name = crawler.__name__
         try:
             jobs = crawler()
-            RUN_REPORT["sources"][name] = {"collected": len(jobs), "healthy": bool(jobs)}
+            RUN_REPORT["sources"].setdefault(name, {"collected": len(jobs), "healthy": bool(jobs)})
             if not jobs:
                 RUN_REPORT["warnings"].append(f"{name}: zero postings; source health needs checking")
             for job in sorted(jobs, key=lambda j: candidate_priority(j, seen)):

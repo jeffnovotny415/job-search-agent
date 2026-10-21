@@ -8,6 +8,7 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 - [Remote Impact](https://remoteimpact.org)
 - [Tech Jobs for Good](https://techjobsforgood.com)
 - [FFWD Jobs](https://jobs.ffwd.org)
+- [NTEN](https://www.nten.org/jobs): employment, contracts, and RFPs for Ravensbreath Lab
 - Idealist and Wellfound saved-search/recommendation emails in Gmail
 - LinkedIn and Built In integrations remain disabled
 
@@ -27,6 +28,17 @@ This is the inexpensive discovery and first-screen stage of a two-stage job sear
 
 **Trello handoff**
 Cards in Watching say **First-pass lead — awaiting Claude deep vet**. They include employer, source link, listed location/pay, and specific facts to verify. They do not claim to be fully vetted, assign a suitability score, or invent salary recommendations or remote eligibility.
+
+**NTEN employment and client projects**
+NTEN shares the Watching feed, with `[Employment]`, `[Contract]`, or `[RFP]` in each card title. Website/web-app, integration, automation, internal-tool, database, and nonprofit-operations signals are screened locally; bare “development” is not a software signal. Employment relevance uses the title to avoid treating incidental CRM/website mentions in fundraising jobs as technical work. Project descriptions and attached PDF text can supply concrete scope signals.
+
+Annual employment uses the existing salary floor and part-time exception; hourly contracts use the existing $65 floor. Explicit **project budgets remain total project budgets**, and unknown periods remain unknown. Neither is converted into a salary or an invented hourly rate. Project scope, effort, pricing, references, and suitability remain for the separate deep vet.
+
+NTEN is checked at most once per Eastern calendar day, including failed attempts. Reruns reuse the snapshot stored in the existing private `alert_extractions.json`. Public pages and linked PDFs are fetched without AI, subject to each host's robots rules, crawl delay/request rate, a minimum one-second interval, and rate-limit deferral. Crawl failures appear in the run report instead of masquerading as zero matches.
+
+Cards preserve posting dates, pay units, location notes, deadline/submission/reference excerpts, and links to the RFP and addenda. Extracted excerpts are evidence to verify, not a compliance verdict. Reads are capped at five PDFs per listing, 8 MiB per response, and 30 pages/100,000 characters per PDF. Scanned, encrypted, inaccessible, non-PDF, and truncated documents stay linked with verification flags; no paid OCR or model extraction is added. A failed re-read retains prior document text with a stale-data warning.
+
+Material changes to title, employer, location, compensation, opportunity type, scope text, or document text/links are detected using a fingerprint. Changed active cards receive a dated note (even if the new terms fail screening), without moving them or overwriting user notes. Unchanged listings are skipped, failed updates retry, and archived passes are never reopened. Excerpts are bounded; if an existing card has no room for an update, it stays in the retry/review queue. Posting timestamp/whitespace-only changes do not create updates.
 
 **Gmail pipeline tracking**
 Scans the inbox daily for emails from active pipeline companies. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also reads job alert emails to extract basic listing metadata.
@@ -158,6 +170,8 @@ The API spending ceiling remains **$0.75/day**, resetting at midnight America/Ne
 | `contract_hourly_floor` | 65 | Minimum viable contract/hourly rate |
 | `home_state` | NJ | Required state eligibility for explicitly restricted remote jobs |
 | `enable_wellfound_alerts` | true | Read existing Wellfound emails |
+| `enable_nten` | true | Daily NTEN source, with no model calls |
+| `nten_opportunity_types` | Employment, Contract, RFP | Optional type filter within the same feed |
 | `gmail_lookback_days` | 7 | Recent discovery/status emails |
 | `daily_api_budget_usd` | 0.75 | Cap remaining model-assisted status tracking |
 | `max_retry_jobs_per_run` | 8 | Historical job rechecks per run |
@@ -174,6 +188,7 @@ The Claude daily trigger is unchanged. Wellfound alerts observed at 9:25 AM East
 ```
 jeff_job_agent.py    # Crawlers, Gmail/Trello orchestration
 first_pass.py        # Free metadata screening and HTML email parsers
+nten_source.py       # Daily NTEN crawl, project units, PDF evidence and change detection
 geographic_filters.py # Country/currency rules and explicit state eligibility
 job_quality.py      # Job identity, duplicate detection, retry policy
 api_budget.py       # Persistent daily API spending guard

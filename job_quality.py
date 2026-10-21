@@ -171,6 +171,9 @@ def should_process(seen, job, now=None):
     entry = cache_entry(seen, job)
     if not entry:
         return True
+    if (job.get("source") == "NTEN" and job.get("source_fingerprint") and
+            entry.get("source_fingerprint") != job["source_fingerprint"]):
+        return True
     if (entry.get("policy_version") != POLICY_VERSION and
             entry.get("status") in {"rejected", "below_threshold", "needs_review", "description_unavailable", "score_failed", "budget_deferred"}):
         return True  # reconsider previous deep-vet exclusions only when the role is rediscovered
@@ -198,6 +201,10 @@ def record_decision(seen, job, status, reason, result=None, card_id=None):
         "description_source": job.get("description_source"),
         "description_sha256": hashlib.sha256(job.get("description", "").encode()).hexdigest(),
     }
+    if job.get("source_fingerprint"):
+        entry["source_fingerprint"] = job["source_fingerprint"]
+        entry["opportunity_type"] = job.get("opportunity_type")
+        entry["compensation_unit"] = job.get("compensation_unit")
     if result:
         entry["result"] = result
         if "score" in result:

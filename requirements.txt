@@ -8,3 +8,4 @@ anthropic
 python-dotenv
 lxml
 pycountry==24.6.1
+pypdf==6.21.1
