@@ -2,6 +2,34 @@
 
 This is the inexpensive discovery and first-screen stage of a two-stage job search. It collects listings, checks title/location/remote/pay metadata, and places promising **named-company** leads in Trello. A separate Claude project does the deep vet: full descriptions, employer websites, responsibilities, credentials, and overall suitability.
 
+## November 6 screening update
+
+The full-time salary floor remains **$90,000**, with the existing part-time exception and **$65/hour** contract floor. These changes add no AI/model calls. Claude remains the daily trigger and the separate deep-vet stage.
+
+Roles require both a lane noun and a relevant technical/operations domain. Technical project managers and Salesforce administrators remain eligible. Generic engineering, programming, specialist, EPC and construction titles no longer pass on a stray “operations” or “AI” match. Projects retain their separate web/app/integration rules.
+
+**Lane 4: Builder** searches cover product/AI/solutions builders, internal tools, automation, low/no-code development and technical product ownership. Cards show `Lane: Builder` and observed signals. Founding/software/product engineer titles need a verified affirmative AI-assisted-building signal; they are not added as broad searches. Explicit AI bans fail; engineering interview/experience/degree requirements are flagged for explicit Builder titles (and exclude the generic engineer exception).
+
+Remote-state restrictions, more than 10% field/site work, at least 25% sales/business-development work, task-based gig work, and foreign-region title suffixes receive deterministic checks. Headquarters addresses are not treated as applicant restrictions. Remote Impact compensation headers take priority, and WordPress body currency evidence corrects ambiguous sidebar budgets.
+
+Cards use company plus title without bracketed employment tags. Type follows the Roles/Projects track; genuine RFPs remain marked in the description. Resolvable employer ATS links are retained; recovery reads the board and at most one employer posting, cached for seven days (failed board reads for one day). Blocked pages still need manual deep vet. Gmail moves update the Stage line in the same Trello request while preserving other description text. No historical cards are bulk-rewritten. Rediscovered prior filtered listings are reconsidered under the new policy; created/archived cards retain duplicate protection.
+
+### Dot / Upwork instructions to apply separately
+
+Upwork email vetting and card creation belong to **Dot**, not this Python crawler. Changing this repository does not update Dot. Paste the following into the Dot task that reads Upwork alerts:
+
+> Keep Upwork email intake in Dot. Apply a cheap first-pass screen and use the same Trello queues and compact card format as the crawler; leave deeper fit analysis to the Claude project.
+>
+> - Reject hourly contracts when the posted maximum is below $65/hour. A $12–45/hour range fails; do not waive it because the budget might be negotiable. Keep annual salary, hourly rates and total project budgets separate. Full-time roles use a $90k floor, with the part-time employment exception. Never annualize a fixed project budget.
+> - Require an identifiable hiring company/client; do not invent a name. Reject explicit non-US/non-USD, NJ-ineligible remote, hybrid/onsite requirements, and task-paid AI-training/benchmark gigs. Unknown pay or eligibility may reach Watching with a specific verification flag.
+> - Staff/ongoing positions go to Watching — Roles; bounded client deliverables go to Watching — Projects. Preserve RFP as a type where applicable. For Roles use the stricter domain-plus-lane-noun and Builder rules documented above; do not apply the generic developer/engineer exclusions to website/app projects.
+> - Flag “New/low-history client” only when the exposed account age is under 30 days AND spend is under $500. Flag “Crowded posting” at 50+ proposals. Flag “Full-time load; vet as a role” when a Project advertises more than 30 hours/week. Unknown client facts remain unknown, not zero.
+> - Use a verified public `https://www.upwork.com/freelance-jobs/apply/<slug>_~<id>/` URL when available and readable. Do not invent a slug or claim a fetch succeeded. If blocked, retain the original link and flag “Needs browser read.”
+> - Deduplicate against all Trello lists and archived cards. Name cards `Company — Title`; omit `UNASSESSED` and bracketed type tags. Never reopen an archived pass.
+> - Use short fields: Stage, Track, Company, Source, URL, Found, Listed location, Remote, Listed pay (with units), Type, Needs verification, Next step. Add Lane: Builder, employer link, and proposal deadline/document links when known. Stage starts “First-pass lead — awaiting Claude deep vet.” Keep notes to factual flags, not essays. Next step is the Claude deep vet.
+
+The offline Upwork rate regression verifies the shared screening rule only; it is not a test of Dot's live intake. Dot's changes need a real alert check after its instructions are updated.
+
 ## What it does
 
 **Discovery**
@@ -66,7 +94,7 @@ Exact notification menus depend on the account/site version. No passwords or API
 Scans the inbox daily for emails from active role pipeline companies. Project cards are excluded from both application-status scanning and reconciliation, including when moved to another list. Uses Claude to classify each email (interview invite, rejection, application confirmation) and moves Trello cards between pipeline stages automatically. Also reads job alert emails to extract basic listing metadata.
 
 **Pre-filtering**
-A cheap keyword pre-filter runs before any Claude API calls, skipping obvious mismatches (sales titles, engineering roles, etc.) without spending API tokens. Saves roughly 30-40% of API costs on a typical run.
+Deterministic title, location, pay and explicit-requirement checks screen discoveries without model calls. A separate Roles title gate prevents broad technical words from qualifying unrelated occupations. Models remain limited to existing email parsing/status tasks where needed.
 
 **Deduplication**
 Posting URLs identify jobs, with company/title checks against all Trello lists and archived cards. Archived cards represent roles already passed on and are not recreated. Employer identity is checked separately from title similarity.
@@ -168,7 +196,7 @@ python3 jeff_job_agent.py --gmail
 
 Production runs in a separate private GitHub runner repository, keeping personal state and logs private. A Claude routine triggers its `workflow_dispatch` each morning. GitHub's `schedule` trigger is disabled. A concurrency guard prevents overlapping runs.
 
-Deploy these together: `jeff_job_agent.py`, `first_pass.py`, `geographic_filters.py`, `job_quality.py`, `api_budget.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
+Deploy these together: `jeff_job_agent.py`, `role_screen.py`, `first_pass.py`, `geographic_filters.py`, `job_quality.py`, `api_budget.py`, `engagement.py`, `nten_source.py`, `additional_sources.py`, `community_alerts.py`, `requirements.txt`, and `tests/`. Keep credentials, profile, caches, and Trello evaluation data out of the public repository. The runner runs the offline test suite before executing and commits its private state afterward.
 
 
 ---

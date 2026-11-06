@@ -28,3 +28,11 @@ def track(job):
 def project_card(card, list_name=''):
     return (list_name == PROJECTS or '**Track:** Projects' in card.get('desc', '')
             or bool(re.search(r'—\s*\[RFP\]', card.get('name', ''))))
+
+
+def opportunity_type(job):
+    """Card type follows delivery track, while preserving a genuine RFP."""
+    if track(job) == 'Projects':
+        return 'RFP' if job.get('opportunity_type') == 'RFP' else 'Project'
+    return 'Contract' if (job.get('opportunity_type') == 'Contract' or
+                          re.search(r'contract|freelance|1099', job.get('employment_type', ''), re.I)) else 'Employment'

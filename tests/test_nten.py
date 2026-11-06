@@ -158,7 +158,7 @@ class NtenDeliveryTests(unittest.TestCase):
     def test_rfp_creates_named_labeled_card_with_no_ai_or_extra_fetch(self):
         with patch.object(agent,'create_trello_card',return_value={'id':'card'}) as create,patch.object(agent,'budgeted_message') as ai,patch.object(agent,'safe_get') as fetch:
             self.assertEqual(self.process(opportunity()),'created')
-            self.assertIn('[RFP]',create.call_args.args[1]);self.assertIn('Total project budget',create.call_args.args[2])
+            self.assertNotIn('[RFP]',create.call_args.args[1]);self.assertIn('**Opportunity:** RFP',create.call_args.args[2]);self.assertIn('Total project budget',create.call_args.args[2])
             self.assertEqual(self.process(opportunity()),'cached')
             ai.assert_not_called();fetch.assert_not_called();create.assert_called_once()
 

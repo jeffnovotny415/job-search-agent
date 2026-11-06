@@ -96,6 +96,14 @@ def wordpress_detail(data, job):
         raise ValueError('WordPress employer/type layout changed')
     job.update(company=fields['Company'], employment_type=fields['Job Type'],
                salary=fields.get('Budget', 'Not listed'), location=fields.get('Location', 'Not specified'))
+    body = soup.select_one('.job-detail__body')
+    if body:
+        job['description'] = body.get_text('\n', strip=True)
+    # The sidebar can strip C$ to $. The posting body has the fuller denomination.
+    from geographic_filters import foreign_currency
+    currency = foreign_currency(job.get('description', ''))
+    if currency and not foreign_currency(job['salary']):
+        job['salary'] = currency + ' ' + job['salary']
     for key in ('opportunity_type', 'compensation_unit', 'engagement_track'):
         job.pop(key, None)
     # This board calls all compensation "Budget"; only explicit units are used.

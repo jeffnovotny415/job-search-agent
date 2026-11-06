@@ -186,5 +186,174 @@ class FeedbackPipeline(unittest.TestCase):
             self.assertTrue(all(c.args[1].startswith('User edit') and '2 cards' in c.args[1] for c in update.call_args_list))
 
 
+    def test_nov6_reported_titles_never_create_cards(self):
+        cases = [
+            ('Critical Loop', 'Security Operations Engineer'),
+            ('Horizon3', 'Staff Technical Support Engineer'),
+            ('SCS Global', 'Technical Specialist I, Seafood COC & Aquaculture - Certification & Sales, LATAM'),
+            ('Toptal', 'Cryptography Specialist for AI lab'),
+            ('Golden 1', 'Web Applications Programmer II'),
+            ('EDF', 'Senior EPC Project Manager'),
+        ]
+        with patch.object(agent, 'create_trello_card') as create, patch.object(agent, 'budgeted_message') as ai:
+            for source in ['Remote Impact', 'We Work Remotely', 'NTEN']:
+                for company, title in cases:
+                    with self.subTest(source=source, title=title):
+                        agent._PROCESSED_THIS_RUN.clear()
+                        self.assertEqual(agent.process_job(job(company=company, title=title, source=source), {}, [], 'roles'), 'filtered')
+            create.assert_not_called(); ai.assert_not_called()
+
+    def test_datakind_still_passes_at_98_to_109k(self):
+        candidate = job(company='DataKind', title='IT Operations & Security Lead', salary='$98–109k per year')
+        with patch.object(agent, 'create_trello_card', return_value={'id':'c'}) as create, patch.object(agent, 'budgeted_message') as ai:
+            self.assertEqual(agent.process_job(candidate, {}, [], 'roles'), 'created')
+            self.assertIn('$98–109k', create.call_args.args[2])
+            ai.assert_not_called()
+        self.assertEqual(agent.CONFIG['annual_salary_floor'], 90000)
+
+    def test_builder_titles_and_engineer_exception(self):
+        import role_screen
+        for title in ['Product Builder', 'AI Builder', 'Internal Tools Lead', 'Automation Specialist', 'Low-code Developer', 'Technical Product Owner', 'Solutions Builder']:
+            with self.subTest(title=title):
+                candidate = job(title=title, description='Build with AI and Retool.')
+                self.assertIsNone(role_screen.screen(candidate)[0])
+                self.assertEqual(candidate['lane'], 'Builder')
+        for title in ['Software Engineer', 'Founding Engineer', 'Product Engineer']:
+            self.assertIsNone(role_screen.screen(job(title=title, description='Build with AI using Claude Code.'))[0])
+            self.assertTrue(role_screen.screen(job(title=title, description='Maintain the production application.'))[0])
+            self.assertTrue(role_screen.screen(job(title=title, description='We use Cursor.', description_verified=False))[0])
+            self.assertTrue(role_screen.screen(job(title=title, description='Cursor is prohibited.'))[0])
+        self.assertTrue(role_screen.screen(job(title='Security Operations Engineer', description='We use Copilot.'))[0])
+        self.assertFalse(agent.title_is_plausible(job(title='Technical Specialist')))
+        self.assertFalse(agent.title_is_plausible(job(title='Manager')))
+        self.assertTrue(agent.title_is_plausible(job(title='Technical Project Manager')))
+
+    def test_builder_description_warnings_and_ai_ban(self):
+        import role_screen
+        for text in ['No AI-generated code.', 'Work without AI tools.']:
+            self.assertTrue(role_screen.screen(job(title='Product Builder', description=text))[0])
+        for text in ['A coding interview is required.', '5+ years production experience with React.', 'CS degree required.', 'We reject vibe-coded work.']:
+            reason, flags = role_screen.screen(job(title='Product Builder', description=text))
+            self.assertIsNone(reason)
+            self.assertTrue(flags, text)
+
+    def test_builder_negated_requirements_do_not_block_engineer_exception(self):
+        import role_screen
+        for text in [
+            'We build with AI. No coding interview.',
+            'We build with AI. A coding interview is not required.',
+            'We build with AI. We do not ban AI tools.',
+            'We build with AI. No AI-generated code restrictions.',
+        ]:
+            self.assertIsNone(role_screen.screen(job(title='Software Engineer', description=text))[0], text)
+
+    def test_builder_delivery_bypasses_only_engineering_block(self):
+        for title, expected in [('Software Engineer', 'created'), ('Software Engineer, Web3', 'filtered')]:
+            agent._PROCESSED_THIS_RUN.clear()
+            with patch.object(agent, 'create_trello_card', return_value={'id':'c'}) as create, patch.object(agent, 'budgeted_message') as ai:
+                candidate=job(title=title, description='Build with AI using Claude Code.')
+                self.assertEqual(agent.process_job(candidate, {}, [], 'roles'), expected)
+                if expected == 'created':
+                    self.assertIn('**Lane:** Builder', create.call_args.args[2])
+                ai.assert_not_called()
+
+    def test_remote_state_forms_and_no_headquarters_false_positive(self):
+        from geographic_filters import state_eligibility
+        for location in ['Remote California', 'Remote CA', 'Remote in CA only', 'Remote CA, US']:
+            self.assertTrue(state_eligibility('', location)[0], location)
+        for text in ['Remote in CA only.', 'Must reside in CA.', 'You must reside in California.']:
+            self.assertTrue(state_eligibility(text, 'Remote US')[0], text)
+        for location in ['Remote NJ', 'Remote New Jersey', 'Remote CA, NJ', 'Remote US', 'Remote; headquarters in California']:
+            self.assertIsNone(state_eligibility('', location)[0], location)
+        self.assertIsNone(state_eligibility('This is not remote in CA only.', 'Remote US')[0])
+        self.assertIsNone(state_eligibility('', {'jobLocation': {'address': {'addressRegion':'CA', 'addressCountry':'US'}}, 'jobLocationType':'TELECOMMUTE'})[0])
+
+    def test_edf_field_time_sales_share_and_task_pay(self):
+        for text, expected in [
+            ('Approximately 20% of the time is spent in the field nationally and internationally.', 'field/site'),
+            ('20% site visits.', 'field/site'), ('15–25% visiting projects.', 'field/site'),
+            ('50% sales and business development.', 'sales/business'),
+            ('25% of your time is spent on business development.', 'sales/business'),
+            ('This is a task-based compensation model.', 'Task-based'),
+            ('You are paid per task.', 'Task-based'),
+            ('Work on AI training tasks.', 'Task-based'),
+        ]:
+            self.assertTrue(any(expected in reason for reason in explicit_description_exclusions(text)), text)
+        for text in ['10% in the field.', '24% sales.', 'No 20% on-site work required.', '20% site visits are optional.', 'Increase sales by 50%.']:
+            self.assertEqual(explicit_description_exclusions(text), [], text)
+
+    def test_remoteimpact_header_salary_without_structured_pay(self):
+        title='Senior EPC Project Manager [Remote]'
+        html=posting(title=title, description='Approximately 20% of the time is spent in the field.') + f'<main><h1>{title}</h1><dl><div><dt>Compensation</dt><dd>$120,800 – $201,300 per year</dd></div></dl></main>'
+        metadata=extract_listing_metadata(html, title, 'https://remoteimpact.org/jobs/edf/')
+        self.assertEqual(posted_pay(metadata['salary']), (201300, 'year', 'USD', True))
+        self.assertIn('field/site', explicit_description_exclusions(metadata['description'])[0])
+        without_json=html[html.index('<main>'):]
+        self.assertEqual(extract_listing_metadata(without_json, title, 'https://remoteimpact.org/jobs/edf/')['salary'], metadata['salary'])
+        self.assertNotIn('salary', extract_listing_metadata(without_json, 'Another title', 'https://remoteimpact.org/jobs/edf/'))
+
+    def test_rsl_body_currency_overrides_generic_sidebar(self):
+        import additional_sources
+        from geographic_filters import foreign_currency
+        fields={'Company':'RSL', 'Job Type':'Project', 'Budget':'$2,000-$2,500', 'Location':'Remote'}
+        html=''.join(f'<div class="job-sidebar__detail"><span class="job-sidebar__detail-label">{k}</span><span class="job-sidebar__detail-value">{v}</span></div>' for k,v in fields.items())
+        html+='<div class="job-detail__body">Our budget is C$2,000–$2,500 on a fixed-price basis.</div>'
+        candidate=job(source='WordPress Jobs', title='WordPress website developer', opportunity_type='Employment')
+        additional_sources.wordpress_detail(html, candidate)
+        self.assertEqual(foreign_currency(candidate['salary']), 'CAD')
+        self.assertEqual(candidate['compensation_unit'], 'project')
+        self.assertEqual(agent.process_job(candidate, {}, [], 'projects'), 'filtered')
+
+    def test_upwork_rate_contract_preserves_upper_bound(self):
+        # Dot owns Upwork intake. This is the shared contract it must enforce;
+        # the test does not imply that this crawler handles Dot's emails.
+        for value, expected in [('$12–45/hr', 'skip'), ('$12–65/hr', 'pass'), ('$65/hour', 'pass')]:
+            self.assertEqual(screen_metadata(job(source='Upwork', employment_type='contract', salary=value))['decision'], expected)
+
+    def test_project_name_and_type_follow_track(self):
+        candidate=job(source='WordPress Jobs', title='WordPress website developer', opportunity_type='Employment', compensation_unit='project', salary='$2500', engagement_track='Projects', description='Build a WordPress website.')
+        with patch.object(agent, 'create_trello_card', return_value={'id':'c'}) as create:
+            self.assertEqual(agent.process_job(candidate, {}, [], {'Roles':'roles', 'Projects':'projects'}), 'created')
+            self.assertEqual(create.call_args.args[1], 'Example Foundation — WordPress website developer')
+            self.assertIn('**Opportunity:** Project', create.call_args.args[2])
+            self.assertNotIn('[Employment]', create.call_args.args[1])
+
+    def test_employer_link_and_full_title_are_rechecked(self):
+        board='https://jobs.ffwd.org/companies/example/jobs/123'
+        employer='https://job-boards.greenhouse.io/example/jobs/12345'
+        board_html=posting(title='IT Operations Manager', url=employer)
+        employer_html=posting(title='IT Operations Manager, LATAM', description='Manage systems.')
+        candidate=job(url=board, title='IT Operations Manager', source='FFWD Jobs', salary='Not listed')
+        with patch.object(agent, 'safe_get', side_effect=[SimpleNamespace(text=board_html, url=board), SimpleNamespace(text=employer_html, url=employer)]) as fetch, patch.object(agent, 'create_trello_card') as create:
+            self.assertEqual(agent.process_job(candidate, {}, [], 'roles'), 'filtered')
+            self.assertEqual(candidate['employer_url'], employer)
+            self.assertEqual(fetch.call_count, 2)
+            create.assert_not_called()
+        desc=agent.build_first_pass_card_description(job(employer_url=employer), screen_metadata(job()))
+        self.assertIn('**Employer link:** '+employer, desc)
+
+    def test_application_link_scoping_excludes_related_jobs(self):
+        employer='https://job-boards.greenhouse.io/datakind/jobs/12345'
+        html=posting() + f'<main><h1>IT Manager</h1><a href="{employer}">Apply on company site</a><a href="https://job-boards.greenhouse.io/other/jobs/54321">Other role</a></main>'
+        self.assertEqual(extract_listing_metadata(html, 'IT Manager')['employer_url'], employer)
+
+    def test_stage_move_updates_one_field_preserving_user_notes(self):
+        current='**Stage:** First-pass lead — awaiting Claude deep vet\n**Track:** Roles\n\nMy notes\nDo not alter these.\n'
+        response=SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'id':'c'})
+        with patch.object(agent, 'get_card_description', return_value=current), patch.object(agent.requests, 'put', return_value=response) as put:
+            agent.move_trello_card('c', 'applied-list', 'Applied')
+            changes=put.call_args.kwargs['data']
+            self.assertEqual(changes['idList'], 'applied-list')
+            self.assertEqual(changes['desc'], current.replace('First-pass lead — awaiting Claude deep vet', 'Applied'))
+            self.assertEqual(put.call_count, 1)
+
+    def test_builder_policy_reconsiders_old_filtered_not_created_jobs(self):
+        candidate=job(title='Product Builder')
+        seen={q.posting_key(candidate): {'status':'filtered', 'policy_version':'2026-09-first-pass-v1'}}
+        self.assertTrue(q.should_process(seen, candidate))
+        seen[q.posting_key(candidate)]['status']='created'
+        self.assertFalse(q.should_process(seen, candidate))
+
+
 if __name__=='__main__':
     unittest.main()

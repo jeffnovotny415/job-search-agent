@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-POLICY_VERSION = "2026-09-first-pass-v1"
+POLICY_VERSION = "2026-11-builder-v1"
 UNKNOWN_COMPANIES = {"", "unknown", "see posting", "not listed", "n a", "not provided", "confidential", "confidential employer", "company not listed"}
 RETRY_STATES = {"score_failed", "delivery_failed", "description_unavailable", "needs_review", "budget_deferred"}
 TRACKING_PARAMETERS = {"gh_src", "source", "ref", "referral", "mc_cid", "mc_eid"}
@@ -175,7 +175,7 @@ def should_process(seen, job, now=None):
             entry.get("source_fingerprint") != job["source_fingerprint"]):
         return True
     if (entry.get("policy_version") != POLICY_VERSION and
-            entry.get("status") in {"rejected", "below_threshold", "needs_review", "description_unavailable", "score_failed", "budget_deferred"}):
+            entry.get("status") in {"filtered", "rejected", "below_threshold", "needs_review", "description_unavailable", "score_failed", "budget_deferred"}):
         return True  # reconsider previous deep-vet exclusions only when the role is rediscovered
     if entry.get("status") not in RETRY_STATES:
         return False

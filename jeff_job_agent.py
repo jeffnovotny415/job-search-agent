@@ -25,6 +25,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,6 +41,7 @@ import base64
 from api_budget import DailyBudget, BudgetExceeded
 import nten_source
 import engagement
+import role_screen
 import additional_sources
 import community_alerts
 from geographic_filters import state_eligibility
@@ -430,6 +432,10 @@ def process_job(job, seen, existing_cards, watching_list_id):
     result = screen_metadata(job, CONFIG["annual_salary_floor"], CONFIG["contract_hourly_floor"])
     if result["decision"] == "skip":
         return finish("filtered", result["reason"], result)
+    role_reason, builder_flags = role_screen.screen(job)
+    if role_reason:
+        return finish("filtered", role_reason, result)
+    result["flags"].extend(builder_flags)
     state_reason, state_flag = state_eligibility(
         job.get("description", "") if job.get("description_verified") else "",
         job.get("location", ""), CONFIG["home_state"])
@@ -465,10 +471,12 @@ def process_job(job, seen, existing_cards, watching_list_id):
 
 def process_opportunity_job(job, seen, existing_cards, watching_list_id, finish):
     """Keep client project rules separate from employment-title/pay heuristics."""
-    if job.get("source") == "NTEN" and job.get("opportunity_type") not in CONFIG["nten_opportunity_types"]:
+    job.setdefault("source_opportunity_type", job.get("opportunity_type", "Employment"))
+    if job.get("source") == "NTEN" and job["source_opportunity_type"] not in CONFIG["nten_opportunity_types"]:
         return finish("filtered", "NTEN opportunity type disabled")
     if not known_company(job.get("company")):
         return finish("needs_review", "Employer/client unavailable; no unnamed card created")
+    job["opportunity_type"] = engagement.opportunity_type(job)
     result = nten_source.screen(job, CONFIG["annual_salary_floor"],
                                 CONFIG["contract_hourly_floor"], CONFIG["home_state"])
     if additional_sources.expired(job):
@@ -477,13 +485,18 @@ def process_opportunity_job(job, seen, existing_cards, watching_list_id, finish)
     # allowing the web/app/database work requested for this source.
     expanded = bool(nten_source.relevant_skills(job))
     web_terms = {"software engineer", "software developer", "frontend engineer", "backend engineer",
-                 "fullstack", "full stack", "ux designer"} if expanded else set()
+                 "fullstack", "full stack", "ux designer"} if expanded and engagement.track(job) == "Projects" else set()
     allowed, reason = pre_filter({**job, "description": ""}, allowed_title_terms=web_terms)
     if not allowed:
         result.update(decision="skip", reason=reason)
     elif (engagement.track(job) == "Roles" and title_is_plausible(job) and
           result["reason"].startswith("No specific technical or nonprofit operations match")):
         result.update(decision="pass", reason="Plausible employment title; needs Claude deep vet")
+    if engagement.track(job) == "Roles":
+        role_reason, builder_flags = role_screen.screen(job)
+        result["flags"].extend(builder_flags)
+        if role_reason:
+            result.update(decision="skip", reason=role_reason)
     match = find_duplicate(job, existing_cards, clean_company_name)
     previous = seen.get(posting_key(job), {})
     changed = bool(previous.get("source_fingerprint") and
@@ -519,7 +532,7 @@ def process_opportunity_job(job, seen, existing_cards, watching_list_id, finish)
     save_seen_jobs(seen)
     try:
         card = create_trello_card(review_destination(watching_list_id, job),
-                                 f"{job['company']} — [{job['opportunity_type']}] {job['title']}",
+                                 f"{job['company']} — {job['title']}",
                                  build_first_pass_card_description(job, result))
     except Exception as exc:
         return finish("delivery_failed", f"Trello {type(exc).__name__}; retry scheduled", result)
@@ -551,24 +564,37 @@ def crawl_nten():
 
 
 def recover_first_pass_metadata(job):
-    """One free posting request, with durable caching of successful and blocked reads."""
+    """Cached board metadata plus at most one resolved employer posting; no AI."""
     missing = {"", "unknown", "not listed", "not specified", "see posting"}
     needs_fetch = (not known_company(job.get("company")) or
                    str(job.get("location") or "").lower() in missing or
                    str(job.get("salary") or "").lower() in missing or
-                   not job.get("description_verified") or not job.get("description"))
+                   not job.get("description_verified") or not job.get("description") or
+                   (job.get("source") == "FFWD Jobs" and not job.get("employer_url")))
     if not needs_fetch or not canonical_url(job.get("url")):
         return
     # Do not follow an unresolved email redirect into a generic jobs feed.
     if "links.wellfound.com/" in job.get("url", ""):
         return
-    key = "firstpass-metadata-v2:" + posting_key(job)
+    key = "firstpass-metadata-v3:" + posting_key(job)
     cached = alert_cache().get(key, {})
     if cached.get("expires", "") > utcnow().isoformat():
         metadata = cached.get("metadata", {})
     else:
         response = safe_get(job.get("url", ""), timeout=15)
         metadata = extract_listing_metadata(response.text, job.get("title", ""), job.get("url", "")) if response is not None else {}
+        employer_url = metadata.get("employer_url") or metadata.pop("employer_redirect", None)
+        if employer_url and employer_url != job.get("url"):
+            employer = safe_get(employer_url, timeout=15)
+            if employer is not None:
+                final_url = getattr(employer, "url", "") or employer_url
+                if urlparse(final_url).hostname != urlparse(job.get("url", "")).hostname:
+                    metadata["employer_url"] = final_url
+                    resolved = extract_listing_metadata(employer.text, metadata.get("title") or job.get("title", ""), final_url)
+                    # An employer's actual role title and restrictions take precedence.
+                    if resolved:
+                        metadata.update(resolved)
+                        metadata["metadata_source"] = "Employer posting + job-board metadata"
         alert_cache()[key] = {"metadata": metadata, "expires": (utcnow() + timedelta(days=7 if metadata else 1)).isoformat()}
         atomic_json(CONFIG["alert_extractions_file"], alert_cache())
     metadata = dict(metadata)
@@ -606,19 +632,24 @@ def flag_same_run_employers():
 
 
 def title_is_plausible(job):
-    return any(contains_term(job.get("title", ""), term) for term in TITLE_ALLOWLIST)
+    return role_screen.plausible(job.get("title", ""))
 
 
 def build_first_pass_card_description(job, result):
-    flags = "\n".join(f"- {flag}" for flag in result["flags"]) or "- Verify full JD and employer site in the Claude project."
+    flags = "\n".join(f"- {flag}" for flag in dict.fromkeys(result["flags"])) or "- Verify full JD and employer site in the Claude project."
     extra = "\n\n" + nten_source.card_details(job, result) if job.get("opportunity_type") else ""
     next_step = ("Use the Claude project to check scope, client, remote delivery, budget versus effort, "
                  "proposal deadline, references, vendor eligibility and linked documents/addenda."
                  if engagement.track(job) == "Projects" else
                  "Use the Claude project to check the full job description, employer website, "
                  "remote/geographic eligibility, responsibilities, compensation and overall fit.")
+    identity = (f"\n**Lane:** {job['lane']}" if job.get("lane") else "")
+    if job.get("builder_signals"):
+        identity += "\n**Builder signals:** " + ", ".join(job["builder_signals"])
+    if job.get("employer_url"):
+        identity += f"\n**Employer link:** {job['employer_url']}"
     return f"""**Stage:** First-pass lead — awaiting Claude deep vet
-**Track:** {engagement.track(job)}
+**Track:** {engagement.track(job)}{identity}
 **Company:** {job['company']}
 **Source:** {job.get('source', 'Not specified')}
 **URL:** {job.get('url', 'Not provided')}
@@ -627,7 +658,7 @@ def build_first_pass_card_description(job, result):
 **Listed location:** {display_location(job.get('location'))}
 **Remote:** {result['checks'].get('remote', 'Needs verification')}
 **Listed pay:** {display_pay(job.get('salary'))}
-**Employment type:** {job.get('employment_type') or 'Not specified'}
+**Type:** {engagement.opportunity_type(job)} — {job.get('employment_type') or 'Hours/terms need verification'}
 **Metadata source:** {job.get('metadata_source', 'Job-board listing')}{extra}
 
 **Needs verification:**
@@ -649,7 +680,7 @@ This card passed a basic metadata screen; it has not received a full suitability
 # never a fit — skip Claude entirely
 TITLE_BLOCKLIST = [
     "power systems engineer", "commercial operations", "pricing", "compliance manager",
-    "asia", "india", "emea", "latam",
+    "asia", "india", "emea", "latam", "apac", "latin america",
     "sales", "account executive", "account manager", "business development",
     "revenue", "customer success", "client success", "gtm", "go-to-market", "commercial lending", "renewals", "marketing", "recruiter",
     "recruiting", "talent acquisition", "finance", "accounting", "payroll",
@@ -670,6 +701,7 @@ TITLE_BLOCKLIST = [
 # Titles containing at least one of these suggest
 # a plausible fit — worth sending to Claude
 TITLE_ALLOWLIST = [
+    "builder", "product owner", "internal tools", "low-code", "no-code", "automation lead",
     "it", "information technology", "technical", "technology", "tech",
     "operations", "ops", "project manager", "program manager", "pm",
     "implementation", "systems", "saas", "platform", "product operations",
@@ -857,6 +889,12 @@ def pre_filter(job, allowed_title_terms=()):
     defense_match = _DEFENSE_CONTRACTOR_RE.search(company)
     if defense_match:
         return False, f"defense contractor: '{defense_match.group(0)}'"
+
+    # Builder candidates still face all unrelated employer/domain exclusions.
+    if role_screen.builder_candidate(title):
+        allowed_title_terms = set(allowed_title_terms) | {
+            "software engineer", "software developer", "frontend engineer",
+            "backend engineer", "full stack", "fullstack"}
 
     # Hard block on title — these are almost never a fit
     for term in TITLE_BLOCKLIST:
@@ -1083,10 +1121,16 @@ def create_trello_card(list_id, name, desc):
     r.raise_for_status()
     return r.json()
 
-def move_trello_card(card_id, list_id):
-    """Moves a card to a different list."""
+def move_trello_card(card_id, list_id, stage=None):
+    """Move and update the Stage field in one request, preserving user notes."""
     url = f"{TRELLO_BASE}/cards/{card_id}"
-    r = requests.put(url, params=trello_params({"idList": list_id}), timeout=30)
+    changes = {"idList": list_id}
+    if stage:
+        current = get_card_description(card_id)
+        line = f"**Stage:** {stage}"
+        changes["desc"] = (re.sub(r"^\*\*Stage:\*\*[^\n]*", lambda _: line, current, count=1, flags=re.M)
+                           if re.search(r"^\*\*Stage:\*\*", current, re.M) else line + "\n" + current)
+    r = requests.put(url, params=trello_params(), data=changes, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -1465,6 +1509,7 @@ def crawl_remote_impact():
         "head of operations", "learning experience", "instructional design",
     ]
 
+    search_terms = list(dict.fromkeys(search_terms + list(role_screen.BUILDER_SEARCH_TERMS)))
     seen_urls = set()
 
     for term in search_terms:
@@ -1568,6 +1613,7 @@ def crawl_tech_jobs_for_good():
         "instructional+design",
     ]
 
+    search_queries = list(dict.fromkeys(search_queries + [term.replace(" ", "+") for term in role_screen.BUILDER_SEARCH_TERMS]))
     for query in search_queries:
         url = f"{base_url}/jobs/?q={query}"
         r = safe_get(url)
@@ -1774,6 +1820,7 @@ def crawl_ffwd():
         f"{base_url}/jobs?q=instructional+design",
     ]
 
+    search_urls = list(dict.fromkeys(search_urls + [(base_url + "/jobs?q=" + term.replace(" ", "+")) for term in role_screen.BUILDER_SEARCH_TERMS]))
     for url in search_urls:
         r = safe_get(url)
         if not r:
@@ -2295,7 +2342,7 @@ def run_gmail_scan():
 
             # Move the card
             try:
-                move_trello_card(card["id"], target_list_id)
+                move_trello_card(card["id"], target_list_id, matched_list_name)
                 card["idList"] = target_list_id
                 mark_email_seen(seen_emails, email_key, company, classification)
                 save_seen_emails(seen_emails)
@@ -2479,7 +2526,7 @@ def run_gmail_trello_reconciliation(service, list_map):
             continue
 
         try:
-            move_trello_card(match["card_id"], target_list_id)
+            move_trello_card(match["card_id"], target_list_id, matched_list_name)
             comment = (
                 f"Auto-moved by reconciliation sync on {datetime.now().strftime('%Y-%m-%d')}\n\n"
                 f"Email: {email['subject']}\n"

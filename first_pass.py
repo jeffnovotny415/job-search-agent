@@ -3,7 +3,7 @@ import base64
 import json
 import math
 import re
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urljoin
 
 from bs4 import BeautifulSoup
 from geographic_filters import foreign_currency, foreign_location
@@ -267,8 +267,9 @@ def extract_listing_metadata(html, expected_title='', page_url=''):
         elif isinstance(value, list):
             for child in value:
                 yield from objects(child)
+    soup = BeautifulSoup(html, 'html.parser')
     candidates = []
-    for script in BeautifulSoup(html, 'html.parser').select('script[type="application/ld+json"]'):
+    for script in soup.select('script[type="application/ld+json"]'):
         try:
             for obj in objects(json.loads(script.get_text())):
                 kind = obj.get('@type')
@@ -278,11 +279,19 @@ def extract_listing_metadata(html, expected_title='', page_url=''):
             continue
     matches = [obj for obj in candidates if titles_match(expected_title, obj.get('title'))]
     obj = matches[0] if len(matches) == 1 else candidates[0] if len(candidates) == 1 else None
-    if not obj:
+    heading = soup.select_one('main h1, h1')
+    visible_title = clean(heading.get_text(' ', strip=True)) if heading else ''
+    host = urlsplit(page_url).hostname or ''
+    # Some boards omit JobPosting JSON-LD. Scope all fallbacks to a matching heading.
+    heading_matches = bool(visible_title and expected_title and (
+        titles_match(expected_title, visible_title) or
+        (len(expected_title) >= 15 and visible_title.casefold().startswith(expected_title.casefold()))))
+    if not obj and not heading_matches:
         return {}
+    obj = obj or {}
     org = obj.get('hiringOrganization') or {}
     location = {k: obj[k] for k in ('jobLocation', 'jobLocationType', 'applicantLocationRequirements') if k in obj}
-    result = {'title': clean(obj.get('title')), 'company': clean(org.get('name')) if isinstance(org, dict) else '',
+    result = {'title': clean(obj.get('title')) or visible_title, 'company': clean(org.get('name')) if isinstance(org, dict) else '',
               'employment_type': clean(obj.get('employmentType')),
               'metadata_source': 'Listing structured data'}
     if location:
@@ -294,18 +303,49 @@ def extract_listing_metadata(html, expected_title='', page_url=''):
         result['description_verified'] = True
     # These sources truncate JSON-LD or omit a separate benefits/eligibility section.
     # Use only the matching posting's known container, never related-job page text.
-    soup = BeautifulSoup(html, 'html.parser')
-    heading = soup.select_one('main h1')
-    host = urlsplit(page_url).hostname or ''
-    if heading and titles_match(obj.get('title'), heading.get_text(' ', strip=True)):
+    if heading and (heading_matches or titles_match(obj.get('title'), visible_title)):
         sections = soup.select('article .prose') if host == 'remoteimpact.org' else []
         if host in {'idealist.org', 'www.idealist.org'}:
             sections = soup.select('main')
+        if is_employer_job_url(page_url):
+            sections = soup.select('#content, .job__description, .posting-page .content')
         if sections:
             visible = ' '.join(section.get_text(' ', strip=True) for section in sections)
             result['description'] = result.get('description', '') + '\n' + visible
             result['description_verified'] = True
+    if host == 'remoteimpact.org' and heading and (heading_matches or titles_match(obj.get('title'), visible_title)):
+        for label in soup.select('main dt'):
+            if clean(label.text).rstrip(':').lower() == 'compensation':
+                value = label.find_next_sibling('dd')
+                if value and re.search(r'[$€£]|\b(?:USD|CAD|EUR|GBP)\b', value.text):
+                    result['salary'] = clean(value.text)
+                    break
+        for link in soup.select('main a[href]'):
+            if link.get('data-track') == 'apply_click':
+                target = urljoin(page_url, link['href'])
+                if urlsplit(target).hostname == host and urlsplit(target).path == urlsplit(page_url).path.rstrip('/') + '/go/':
+                    result['employer_redirect'] = target
+                    break
+    # Only canonical structured URLs or labelled application links qualify. Never
+    # collect arbitrary ATS links from related-job cards or a footer.
+    links = [obj.get('url', '')]
+    links += [urljoin(page_url, a['href']) for a in soup.select('main a[href], article a[href]')
+              if re.search(r'apply|original posting|company site', a.get_text(' ', strip=True), re.I)]
+    employer_links = list(dict.fromkeys(url for url in links if is_employer_job_url(url)))
+    if len(employer_links) == 1:
+        result['employer_url'] = employer_links[0]
+    elif is_employer_job_url(page_url):
+        result['employer_url'] = page_url
     return {k: v for k, v in result.items() if v}
+
+
+def is_employer_job_url(url):
+    parsed = urlsplit(url or '')
+    if parsed.scheme != 'https' or parsed.username or parsed.password:
+        return False
+    return bool((parsed.hostname in {'boards.greenhouse.io', 'job-boards.greenhouse.io', 'boards.eu.greenhouse.io'} and
+                 re.search(r'/jobs/\d+', parsed.path)) or
+                (parsed.hostname in {'jobs.lever.co', 'jobs.ashbyhq.com'} and len(parsed.path.strip('/').split('/')) == 2))
 
 
 def explicit_description_exclusions(text, location=''):
@@ -351,6 +391,15 @@ def explicit_description_exclusions(text, location=''):
             for match in re.finditer(r'\b(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?)\s*)?%\s+(?:required\s+)?travel\b', clause):
                 if max(float(match[1]), float(match[2] or match[1])) > 10 and positive(re.escape(match[0])):
                     hits.append('Listed travel exceeds 10%')
+            percent = r'\b(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?)\s*)?%'
+            for match in re.finditer(percent + r'[^.;%]{0,100}\b(?:in the field|on[- ]site|onsite|site visits|field work|visiting projects|customer sites)\b', clause):
+                if max(float(match[1]), float(match[2] or match[1])) > 10 and positive(re.escape(match[0])):
+                    hits.append('Listed field/site work exceeds 10%')
+            for match in re.finditer(percent + r'\s*(?:(?:of (?:the |your |our )?(?:time|role|work)|is|will be|spent|dedicated|allocated|on|in|to|approximately)\s+)*\b(?:sales|business development)\b', clause):
+                if max(float(match[1]), float(match[2] or match[1])) >= 25 and positive(re.escape(match[0])):
+                    hits.append('Listed sales/business development share is at least 25%')
+            if positive(r'\b(?:task[- ]based compensation|(?:paid|pay|compensation is) per task|per[- ]task (?:pay|compensation|payment)|ai training tasks|benchmark tasks)\b') or positive(r'\$\s*\d+(?:\.\d+)?\s*(?:per task|/task)\b'):
+                hits.append('Task-based gig compensation/work')
             if positive(r'\bcalifornia residents only\b') or positive(r'\bunable to (?:offer employment|hire)\b.{0,45}\bnon[- ]california residents\b'):
                 hits.append('California residency required')
             if positive(r'\blocal candidates only\b') and re.search(r'\b(?:california|san francisco|bay area|san diego|los angeles)\b', display_location(location).lower() + ' ' + clause):

@@ -14,7 +14,7 @@ COUNTRY_NAMES = {name for country in pycountry.countries if country.alpha_2 != '
 COUNTRY_NAMES.discard('Georgia')
 COUNTRY_NAMES.update({'UK', 'U.K.', 'England', 'Scotland', 'Wales', 'South Korea',
                       'North Korea', 'Russia', 'Vietnam', 'Taiwan', 'UAE',
-                      'Europe', 'Asia', 'EMEA', 'LATAM', 'APAC'})
+                      'Europe', 'Asia', 'EMEA', 'LATAM', 'APAC', 'Latin America'})
 COUNTRY_PATTERN = re.compile(r'(?<!\w)(?:' + '|'.join(re.escape(n) for n in sorted(COUNTRY_NAMES, key=len, reverse=True)) + r')(?!\w)', re.I)
 CURRENCY_PATTERN = re.compile(r'\b(?:' + '|'.join(c.alpha_3 for c in pycountry.currencies if c.alpha_3 != 'USD') + r')\b')
 STATE_NAMES = {s.name.lower(): s.code[3:] for s in pycountry.subdivisions.get(country_code='US')}
@@ -47,7 +47,9 @@ def foreign_currency(value):
         return match[0]
     match = re.search(r'(?:CA|AU|NZ|HK|SG|C|A)\$|[€£₹¥₩₽₱฿₫]', text)
     if match:
-        return match[0]
+        return {'C$': 'CAD', 'CA$': 'CAD', 'A$': 'AUD', 'AU$': 'AUD',
+                'NZ$': 'NZD', 'HK$': 'HKD', 'SG$': 'SGD', '€': 'EUR',
+                '£': 'GBP'}.get(match[0], match[0])
     # Currency codes may be lower-case when next to an actual monetary amount.
     for code in re.findall(r'(?i)\b([a-z]{3})\s*\$?\s*\d', text):
         if code.upper() != 'USD' and pycountry.currencies.get(alpha_3=code.upper()):
@@ -122,6 +124,22 @@ def _state_list(text):
 def state_eligibility(text, location='', home_state='NJ'):
     """Return a rejection reason or verification flag; absence of NJ alone proves nothing."""
     text = ' '.join((text or '').split())
+    # Only a bare remote-state location is evidence. A headquarters address in
+    # JSON-LD, or a city followed by a state, is not an eligibility restriction.
+    obj = object_value(location)
+    label = str(obj.get('listingLocation', '') if obj else location or '').strip()
+    remote = re.match(r'^remote\s+(?:in\s+)?', label, re.I)
+    if remote:
+        listed, remainder = _state_list(label[remote.end():])
+        if listed and re.fullmatch(r'(?:only)?[.,\s]*(?:(?:US|USA|United States)[.\s]*)?', remainder, re.I):
+            if home_state not in listed:
+                return 'Eligible states exclude New Jersey: ' + ', '.join(sorted(listed)), None
+    for match in re.finditer(r'\bremote in\s+([^.!?;]+?)\s+only\b', text, re.I):
+        before = text[max(0, match.start() - 60):match.start()]
+        listed, remainder = _state_list(match[1])
+        if (listed and not remainder.strip() and home_state not in listed
+                and not re.search(r'\b(?:not|no|never|clients?|customers?)\b[^.;]{0,45}$', before, re.I)):
+            return 'Eligible states exclude New Jersey: ' + ', '.join(sorted(listed)), None
     states = set()
     restrictions = values(object_value(location).get('applicantLocationRequirements'))
     only_states = bool(restrictions) and all(isinstance(r, dict) and r.get('@type') == 'State' for r in restrictions)

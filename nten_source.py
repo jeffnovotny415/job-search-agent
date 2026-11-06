@@ -207,7 +207,7 @@ def screen(job, annual_floor=90000, contract_floor=65, home_state='NJ'):
         from geographic_filters import foreign_currency
         currency = foreign_currency(job.get('salary', ''))
         candidate['salary'] = f'{currency} (period unknown)' if currency else 'Not listed'
-    if job.get('opportunity_type') in {'Contract', 'RFP'}:
+    if job.get('opportunity_type') in {'Contract', 'RFP', 'Project'}:
         candidate['employment_type'] = 'contract'
     candidate['location'] = clean(display_location(job.get('location')) + ' ' + str(job.get('location_info') or ''))
     result = screen_metadata(candidate, annual_floor, contract_floor)
@@ -251,7 +251,9 @@ def card_details(job, result):
     for label, snippets in job.get('proposal_evidence', {}).items():
         if snippets:
             lines += ['', f'**{label} — source excerpts; verify current documents:**']
-            lines += ['- ' + snippet for snippet in snippets]
+            lines += ['- ' + snippet[:300] for snippet in snippets[:2]]
+            if len(snippets) > 2:
+                lines.append('- More requirements in the original posting/documents; review before submitting.')
     if job.get('documents'):
         lines += ['', '**Linked documents (including addenda):**']
         lines += [f"- [{doc['label']}]({doc['url']}) — {doc.get('status', 'Not read')}" for doc in job['documents']]

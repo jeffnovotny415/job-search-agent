@@ -57,7 +57,7 @@ class EngagementTests(unittest.TestCase):
              patch.object(agent,'create_trello_card',return_value={'id':'c'}) as create, \
              patch.object(agent,'budgeted_message') as ai, patch.object(agent,'safe_get') as fetch:
             for kind,lane in [('RFP','projects'),('Contract','roles')]:
-                candidate=job(source='WordPress Jobs',title='WordPress Developer',opportunity_type=kind,
+                candidate=job(source='WordPress Jobs',title='WordPress Low-code Developer',opportunity_type=kind,
                     employment_type='Contract',compensation_unit='hour',salary='$100/hour',source_fingerprint=kind)
                 agent._PROCESSED_THIS_RUN.clear()
                 self.assertEqual(agent.process_job(candidate,{},[],{'Roles':'roles','Projects':'projects'}),'created')
